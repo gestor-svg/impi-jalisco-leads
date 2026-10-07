@@ -68,7 +68,11 @@ function ejecutarArchivo1(opciones) {
     detenidoPorObjetivo: false,
   };
 
-  const titularesVistos = {};
+  // Se arranca con lo que YA está en el Sheet (de corridas/bloques
+  // anteriores), no solo vacío — así una campaña encadenada (campana.gs)
+  // nunca reprocesa un titular ya resuelto, sin importar cuántos bloques
+  // lleve ni si este bloque específico es el primero o el número 8.
+  const titularesVistos = obtenerTitularesYaRegistrados_();
   let validados = contarValidadosJalisco_();
 
   for (let i = 0; i < resultadoMarcia.resultados.length; i++) {

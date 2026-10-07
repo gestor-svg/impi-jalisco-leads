@@ -142,3 +142,28 @@ function contarValidadosJalisco_() {
   const hoja = obtenerPestana_(SHEETS_PESTANAS.VALIDADOS_JALISCO);
   return Math.max(hoja.getLastRow() - 1, 0);
 }
+
+/**
+ * Lee la columna "titular" de Validados_Jalisco + Sin_CP y regresa un set
+ * (normalizado, mismo normalizarNombreEmpresa_ que el resto del matching)
+ * de los titulares que YA se procesaron en corridas anteriores — permite
+ * que la campaña encadenada (campana.gs) sea resumible sin releer un
+ * índice/cursor aparte: la fuente de verdad de "qué ya se hizo" es el
+ * propio Sheet, no un contador en Script Properties que se podría
+ * desincronizar.
+ */
+function obtenerTitularesYaRegistrados_() {
+  const set = {};
+  [SHEETS_PESTANAS.VALIDADOS_JALISCO, SHEETS_PESTANAS.SIN_CP].forEach(function (nombrePestana) {
+    const hoja = obtenerPestana_(nombrePestana);
+    const idxTitular = ENCABEZADOS[nombrePestana].indexOf('titular');
+    const ultimaFila = hoja.getLastRow();
+    if (ultimaFila < 2) return; // solo encabezado, sin datos.
+    const valores = hoja.getRange(2, idxTitular + 1, ultimaFila - 1, 1).getValues();
+    valores.forEach(function (fila) {
+      const titular = String(fila[0] || '').trim();
+      if (titular) set[normalizarNombreEmpresa_(titular)] = true;
+    });
+  });
+  return set;
+}
