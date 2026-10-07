@@ -54,6 +54,7 @@ def cp_titular():
         "codigo_postal": resultado.codigo_postal,
         "nombre_titular": resultado.nombre_titular,
         "poblacion": resultado.poblacion,
+        "fecha_concesion": resultado.fecha_concesion,
         "error": resultado.error,
     }), 200
 

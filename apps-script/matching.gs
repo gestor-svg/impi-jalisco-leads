@@ -146,6 +146,47 @@ function buscarMatchTitularEnDenue_(nombreTitular, indiceDenue) {
 }
 
 // ---------------------------------------------------------------------------
+// CP -> ¿es de Jalisco? (para el fallback de MARCANET)
+// ---------------------------------------------------------------------------
+
+// Rango típico de códigos postales de Jalisco según SEPOMEX (44000-49999) —
+// heurística de respaldo, NO exhaustiva (hay algo de traslape en los bordes
+// con Colima/Nayarit/Zacatecas/Aguascalientes/Michoacán/Guanajuato). Se usa
+// SOLO como señal secundaria; la señal primaria y más confiable es
+// construirSetCPsJalisco_(), que arma el set de CPs reales a partir del
+// propio pull de DENUE ya filtrado por entidad=Jalisco (dato de INEGI, no
+// una heurística de rango).
+const MATCHING_CP_JALISCO_DESDE = 44000;
+const MATCHING_CP_JALISCO_HASTA = 49999;
+
+/** Arma un set de códigos postales reales vistos en el pull de DENUE
+ *  (ya filtrado por entidad=Jalisco) — fuente primaria y confiable de
+ *  "este CP existe en Jalisco". */
+function construirSetCPsJalisco_(registrosDenue) {
+  const set = {};
+  registrosDenue.forEach(function (registro) {
+    const cp = String(registro.CP || '').trim();
+    if (cp) set[cp] = true;
+  });
+  return set;
+}
+
+/**
+ * @param {string} cp Código postal a verificar (puede venir con espacios).
+ * @param {Object} setCPsJalisco Resultado de construirSetCPsJalisco_().
+ * @returns {boolean}
+ */
+function esCpDeJalisco_(cp, setCPsJalisco) {
+  const limpio = String(cp || '').trim();
+  if (!limpio) return false;
+  if (setCPsJalisco && setCPsJalisco[limpio]) return true; // señal primaria.
+
+  const numero = parseInt(limpio, 10);
+  if (isNaN(numero)) return false;
+  return numero >= MATCHING_CP_JALISCO_DESDE && numero <= MATCHING_CP_JALISCO_HASTA; // respaldo.
+}
+
+// ---------------------------------------------------------------------------
 // Filtro de persona moral (decisión del 6 oct 2026: solo personas morales)
 // ---------------------------------------------------------------------------
 

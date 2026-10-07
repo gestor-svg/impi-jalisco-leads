@@ -99,6 +99,7 @@ class ResultadoCP:
     codigo_postal: Optional[str] = None
     nombre_titular: Optional[str] = None
     poblacion: Optional[str] = None
+    fecha_concesion: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -249,6 +250,11 @@ class IMPIBuscadorPorRegistro:
         if 'Datos del titular' not in texto_completo:
             return ResultadoCP(encontrado=False, error='La ficha de detalle no trae sección "Datos del titular".')
 
+        # "Fecha de concesión" vive en "Datos generales", ANTES de "Datos
+        # del titular" — se lee del texto completo, no de la ventana
+        # recortada de abajo.
+        fecha_concesion = self._extraer_campo(texto_completo, 'Fecha de concesión')
+
         # La sección "Datos del titular" viene antes de "Establecimiento" o
         # "Datos del apoderado" (lo que aparezca primero) — se recorta el
         # texto a esa ventana para no leer el CP del apoderado por error.
@@ -263,9 +269,9 @@ class IMPIBuscadorPorRegistro:
         cp = self._extraer_campo(seccion_titular, 'Código postal')
 
         if not cp:
-            return ResultadoCP(encontrado=False, nombre_titular=nombre, poblacion=poblacion, error='Código postal vacío o no encontrado en la ficha.')
+            return ResultadoCP(encontrado=False, nombre_titular=nombre, poblacion=poblacion, fecha_concesion=fecha_concesion, error='Código postal vacío o no encontrado en la ficha.')
 
-        return ResultadoCP(encontrado=True, codigo_postal=cp.strip(), nombre_titular=nombre, poblacion=poblacion)
+        return ResultadoCP(encontrado=True, codigo_postal=cp.strip(), nombre_titular=nombre, poblacion=poblacion, fecha_concesion=fecha_concesion)
 
     @staticmethod
     def _extraer_campo(texto: str, etiqueta: str) -> Optional[str]:
