@@ -7,15 +7,31 @@
  * configuración (audiencia personalizada + IAM invoker) — se repiten aquí
  * para este proyecto nuevo, mismo procedimiento.
  *
- * ⚠️ PENDIENTE — requiere que la audiencia personalizada de Cloud Run y el
- * permiso roles/run.invoker ya estén configurados para EL CLIENT ID DE ESTE
- * proyecto de Apps Script (distinto al de cloudrun-impi-fonetico, cada
- * proyecto de Apps Script tiene el suyo). Hasta completar esos pasos,
- * llamarCpTitular_() falla con 401/403 aunque el código esté correcto.
+ * ✅ Audiencia personalizada + IAM invoker ya configurados (7 oct 2026),
+ * validado end-to-end con el caso real de TURBOPARTES GDL.
+ *
+ * Secreto compartido: se lee de Script Properties (CP_TITULAR_SHARED_SECRET),
+ * NUNCA hardcodeado en el código — este repo es público. Configúralo una
+ * vez desde el editor: Configuración del proyecto (ícono de engrane) ->
+ * Propiedades de secuencia de comandos -> Agregar propiedad del script ->
+ * nombre "CP_TITULAR_SHARED_SECRET", valor = el secreto real (pídeselo al
+ * dueño del proyecto, nunca lo pongas en un archivo que se vaya a subir a
+ * git). El valor vigente en Cloud Run se rotó el 7 oct 2026 porque el
+ * secreto anterior quedó expuesto en el historial de git de este repo.
  */
 
 const CP_TITULAR_SERVICE_URL = 'https://impi-cp-titular-633481477478.us-central1.run.app';
-const CP_TITULAR_SHARED_SECRET = 'dbd5f8abb03b2952aa8ba0deb1d75161181f625fcd6647c42f7cc82c7bf5ccef';
+
+function obtenerSecretoCpTitular_() {
+  const secreto = PropertiesService.getScriptProperties().getProperty('CP_TITULAR_SHARED_SECRET');
+  if (!secreto) {
+    throw new Error(
+      'Falta configurar CP_TITULAR_SHARED_SECRET en Script Properties — ' +
+      'Configuración del proyecto -> Propiedades de secuencia de comandos.'
+    );
+  }
+  return secreto;
+}
 
 /**
  * @param {string} numeroRegistro
@@ -33,7 +49,7 @@ function llamarCpTitular_(numeroRegistro, numeroExpediente) {
     contentType: 'application/json',
     headers: {
       'Authorization': 'Bearer ' + idToken,
-      'X-Internal-Secret': CP_TITULAR_SHARED_SECRET,
+      'X-Internal-Secret': obtenerSecretoCpTitular_(),
     },
     payload: JSON.stringify({ numero_registro: String(numeroRegistro), numero_expediente: String(numeroExpediente) }),
     muteHttpExceptions: true,
