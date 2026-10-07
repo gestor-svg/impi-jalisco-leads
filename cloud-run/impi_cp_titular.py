@@ -118,12 +118,49 @@ class IMPIBuscadorPorRegistro:
         @param numero_expediente Número de expediente (de MARCia: applicationNumber)
                — OBLIGATORIO para desambiguar, un mismo registro puede traer
                varios expedientes de marcas distintas (hallazgo arriba).
+
+        BUG REAL encontrado en la primera corrida a escala (7 oct 2026, lote
+        de 100): 35 de 39 candidatos que necesitaban este respaldo fallaron
+        con "no trajo ningún expediente" — pero NO era degradación de
+        MARCANET por volumen (se confirmó reproduciendo un caso fallido en
+        aislamiento, sin lote, y volvió a fallar igual). La causa real:
+        cuando un número de registro tiene UN SOLO expediente coincidente
+        (el caso más común — el caso con 2 coincidencias, como TURBOPARTES
+        GDL/registro 22126, que fue el único probado a mano antes, resultó
+        ser el caso MENOS común), MARCANET NO regresa una tabla de
+        resultados — regresa un 302 redirect DIRECTO a la ficha de detalle
+        (`requests` lo sigue solo, así que _buscar_por_registro() ya
+        aterriza en esa ficha). El código original siempre esperaba una
+        tabla con un link que clickear, así que en el caso de un solo
+        match no encontraba ningún `<a>` con el texto del expediente (la
+        ficha de detalle no tiene ese link, es texto plano) y reportaba
+        error aunque los datos sí estaban ahí. Verificado con un caso real
+        (registro 97361, expediente 91274): el detail page ya traía
+        "Número de expediente: 91274" exacto.
         """
         try:
             self._obtener_viewstate()
-            fila_html = self._buscar_por_registro(numero_registro)
-            source_id = self._encontrar_source_expediente(fila_html, numero_expediente)
+            resultado_busqueda = self._buscar_por_registro(numero_registro)
 
+            if self._es_pagina_detalle(resultado_busqueda):
+                # Caso común: un solo expediente coincidente, MARCANET ya
+                # redirigió directo a la ficha — no hace falta el 2do paso.
+                texto_pagina = BeautifulSoup(resultado_busqueda, 'lxml').get_text('\n')
+                expediente_en_pagina = self._extraer_campo(texto_pagina, 'Número de expediente')
+                if str(expediente_en_pagina).strip() != str(numero_expediente).strip():
+                    return ResultadoCP(
+                        encontrado=False,
+                        error=(
+                            f'Registro {numero_registro} redirigió directo a un expediente distinto '
+                            f'({expediente_en_pagina}) del esperado ({numero_expediente}) — no se usa, '
+                            f'evita traer el CP de una empresa equivocada.'
+                        )
+                    )
+                return self._extraer_cp_titular(resultado_busqueda)
+
+            # Caso con varios expedientes coincidentes: sí hay tabla, se
+            # busca el link del expediente correcto y se abre su detalle.
+            source_id = self._encontrar_source_expediente(resultado_busqueda, numero_expediente)
             if not source_id:
                 return ResultadoCP(
                     encontrado=False,
@@ -183,6 +220,14 @@ class IMPIBuscadorPorRegistro:
         vs = soup.find('input', {'name': 'javax.faces.ViewState'})
         if vs and vs.get('value'):
             self.viewstate = vs.get('value')
+
+    @staticmethod
+    def _es_pagina_detalle(html: str) -> bool:
+        """true si la respuesta de la búsqueda ya ES la ficha de detalle
+        (caso de un solo expediente coincidente, MARCANET redirige directo
+        sin pasar por una tabla de resultados) en vez de una lista para
+        elegir de varias."""
+        return 'Datos generales' in html and 'Datos del titular' in html
 
     def _encontrar_source_expediente(self, html_tabla: str, numero_expediente: str) -> Optional[str]:
         """Busca, dentro del HTML de resultados, el link cuyo texto visible
