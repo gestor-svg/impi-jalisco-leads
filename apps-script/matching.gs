@@ -30,10 +30,18 @@
 // Tipos societarios y palabras de relleno a ignorar al inicio o dentro del
 // nombre para la comparación — NO se usan para mostrar el nombre, solo para
 // decidir si hay match.
+// NOTA (bug encontrado en revisión del 7 oct 2026): faltaba "S.A.B." (Sociedad
+// Anónima Bursátil, común en empresas grandes que cotizan en bolsa, ej.
+// "GRUPO LAMOSA, S.A.B. DE C.V." de la prueba real de clase 37) — sin esta
+// variante, quitarSufijoCorporativo_ no la detectaba y el nombre comparado
+// se quedaba con el sufijo completo pegado. Agregadas también SAPIB (variante
+// bursátil de SAPI) por el mismo motivo.
 const MATCHING_SUFIJOS_SOCIETARIOS = [
-  'SA DE CV', 'SA DE C V', 'S A DE C V', 'S A P I DE C V', 'SAPI DE CV',
+  'SA DE CV', 'SA DE C V', 'S A DE C V',
+  'S A B DE C V', 'SAB DE CV', 'S A P I B DE C V', 'SAPIB DE CV',
+  'S A P I DE C V', 'SAPI DE CV',
   'S DE R L DE C V', 'S DE RL DE CV', 'S DE RL', 'S C', 'SC',
-  'S A', 'SA', 'A C', 'AC',
+  'S A B', 'SAB', 'S A', 'SA', 'A C', 'AC',
 ];
 
 function normalizarNombreEmpresa_(nombre) {
@@ -83,14 +91,30 @@ function palabrasComunes_(nombreA, nombreB) {
   return comunes;
 }
 
-/** Umbral de "rigor estricto" (decisión del 6 oct 2026): al menos 2 palabras
- *  de elemento común, o 1 sola palabra si tiene 6+ caracteres (evita que
- *  coincidencias de una palabra corta y genérica, ej. "GRUPO", "CASA",
- *  cuenten como match real). */
+/**
+ * BUG REAL encontrado en la primera corrida piloto (7 oct 2026): la versión
+ * original aceptaba una sola palabra en común si tenía 6+ caracteres,
+ * asumiendo que una palabra larga era señal de ser distintiva. Falso: dos
+ * falsos positivos reales en el piloto —
+ *   "FRACCIONAMIENTO ARNAIZ, S.A. DE C.V." emparejado con DENUE
+ *   "FRACCIONAMIENTO SAN JUAN COSALA RAQUET CLUB" (solo comparten
+ *   "FRACCIONAMIENTO", 16 caracteres, pero es un término GENÉRICO de giro
+ *   —significa "desarrollo habitacional"—, no una marca);
+ *   mismo problema con "ABASTECEDORA MAXIMO" vs DENUE "ABASTECEDORA LUMEN"
+ *   (comparten "ABASTECEDORA", genérico, significa "proveedor").
+ * Palabras de giro de negocio en español (ABASTECEDORA, FRACCIONAMIENTO,
+ * CONSTRUCTORA, INMOBILIARIA, COMERCIALIZADORA, DISTRIBUIDORA, OPERADORA,
+ * DESARROLLADORA, PROMOTORA...) son justo largas Y comunes — la longitud
+ * NO es señal de que algo sea distintivo. Corregido exigiendo SIEMPRE 2+
+ * palabras en común, sin excepción de una sola palabra — consistente con
+ * "prefiero perder leads que generar basura". El costo es perder algunos
+ * matches reales de un solo nombre distintivo (ej. "Microsoft" con
+ * "Microsoft México") — esos caen al respaldo de MARCANET en vez de
+ * quedar sin revisar, así que no se pierden del todo, solo toman la ruta
+ * más lenta.
+ */
 function esElementoComunSuficiente_(palabras) {
-  if (palabras.length >= 2) return true;
-  if (palabras.length === 1 && palabras[0].length >= 6) return true;
-  return false;
+  return palabras.length >= 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +238,10 @@ function test_matchingElementoComun() {
     { a: 'GRUPO LAMOSA, S.A.B. DE C.V.', b: 'GRUPO CONSTRUCTOR PEASA, S.A. DE C.V.', esperado: false }, // "GRUPO" solo, muy corto -> no basta
     { a: 'DAGLE CONSULTORES, S.A. DE C.V.', b: 'DAGLE CONSULTORES SA DE CV', esperado: true },
     { a: 'IMPERQUIMIA, S.A. DE C.V.', b: 'IMPERIAL QUIMICA SA DE CV', esperado: false },
+    // Casos reales que SÍ fallaron en la corrida piloto del 7 oct 2026,
+    // antes del fix — palabra genérica de giro, no de marca.
+    { a: 'FRACCIONAMIENTO ARNAIZ, S.A. DE C.V.', b: 'FRACCIONAMIENTO SAN JUAN COSALA RAQUET CLUB', esperado: false },
+    { a: 'ABASTECEDORA MAXIMO, S.A. DE C.V.', b: 'ABASTECEDORA LUMEN', esperado: false },
   ];
   casos.forEach(function (c) {
     const normA = quitarSufijoCorporativo_(normalizarNombreEmpresa_(c.a));

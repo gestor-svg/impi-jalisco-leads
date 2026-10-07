@@ -53,6 +53,21 @@ function llamarCpTitular_(numeroRegistro, numeroExpediente) {
   return JSON.parse(respuesta.getContentText());
 }
 
+/**
+ * Correr UNA VEZ a mano desde el editor de Apps Script (Ejecutar ->
+ * diagnosticarClientId) — la primera ejecución pedirá autorizar los
+ * scopes del proyecto (acepta el consentimiento). Imprime en el log el
+ * Client ID que hay que registrar como audiencia personalizada en Cloud
+ * Run (paso 3 de la guía en la nota de arriba de este archivo).
+ */
+function diagnosticarClientId() {
+  const idToken = ScriptApp.getIdentityToken();
+  const partes = idToken.split('.');
+  const payload = JSON.parse(Utilities.newBlob(Utilities.base64DecodeWebSafe(partes[1])).getDataAsString());
+  Logger.log('Client ID (audience) de este proyecto de Apps Script: %s', payload.aud);
+  Logger.log('Cuenta efectiva: %s', payload.email || payload.sub);
+}
+
 function test_llamarCpTitular_TurbopartesGDL() {
   const r = llamarCpTitular_('22126', '8215');
   Logger.log(JSON.stringify(r, null, 2));
