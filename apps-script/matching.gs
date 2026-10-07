@@ -173,19 +173,30 @@ function buscarMatchTitularEnDenue_(nombreTitular, indiceDenue) {
 // CP -> ¿es de Jalisco? (para el fallback de MARCANET)
 // ---------------------------------------------------------------------------
 
-// Rango típico de códigos postales de Jalisco según SEPOMEX (44000-49999) —
-// heurística de respaldo, NO exhaustiva (hay algo de traslape en los bordes
-// con Colima/Nayarit/Zacatecas/Aguascalientes/Michoacán/Guanajuato). Se usa
-// SOLO como señal secundaria; la señal primaria y más confiable es
-// construirSetCPsJalisco_(), que arma el set de CPs reales a partir del
-// propio pull de DENUE ya filtrado por entidad=Jalisco (dato de INEGI, no
-// una heurística de rango).
+// Rango de códigos postales de Jalisco según SEPOMEX (44000-49999).
+//
+// BUG REAL encontrado en la primera campaña real (7 oct 2026): un titular
+// ("KOLBEN MOTORS, S.A. DE C.V.") se validó como Jalisco con CP real
+// 37290 — León, Guanajuato, no Jalisco. La causa: la versión original de
+// esta función trataba "¿este CP aparece en mi propio pull de DENUE con
+// entidad=Jalisco?" como señal PRIMARIA y suficiente por sí sola, sin
+// pasar también por el rango numérico — asumiendo que si DENUE ya filtró
+// por entidad=14 (Jalisco), cualquier CP que trajera debía ser de Jalisco
+// también. Falso: DENUE regresó al menos un establecimiento con CP de
+// Guanajuato bajo ese filtro de entidad (dato inconsistente del propio
+// INEGI, o un caso real de negocio con domicilio administrativo distinto
+// al físico — no importa la causa exacta, el dato no es confiable tal
+// cual). Corregido: el rango numérico de SEPOMEX ahora es la señal
+// OBLIGATORIA — el set de CPs de DENUE ya NO basta por sí solo, aunque se
+// sigue usando como filtro adicional (A ambos se les exige AND, no OR).
+// Mismo chequeo aplicado también al camino de match por DENUE en
+// orquestador.gs, que antes no verificaba el CP del match en absoluto.
 const MATCHING_CP_JALISCO_DESDE = 44000;
 const MATCHING_CP_JALISCO_HASTA = 49999;
 
 /** Arma un set de códigos postales reales vistos en el pull de DENUE
- *  (ya filtrado por entidad=Jalisco) — fuente primaria y confiable de
- *  "este CP existe en Jalisco". */
+ *  (ya filtrado por entidad=Jalisco) — señal adicional, YA NO suficiente
+ *  por sí sola (ver nota arriba), siempre se exige también el rango. */
 function construirSetCPsJalisco_(registrosDenue) {
   const set = {};
   registrosDenue.forEach(function (registro) {
@@ -197,17 +208,21 @@ function construirSetCPsJalisco_(registrosDenue) {
 
 /**
  * @param {string} cp Código postal a verificar (puede venir con espacios).
- * @param {Object} setCPsJalisco Resultado de construirSetCPsJalisco_().
+ * @param {Object} [setCPsJalisco] Resultado de construirSetCPsJalisco_() —
+ *        opcional; si se pasa, se exige ADEMÁS del rango (más estricto),
+ *        no en vez del rango.
  * @returns {boolean}
  */
 function esCpDeJalisco_(cp, setCPsJalisco) {
   const limpio = String(cp || '').trim();
   if (!limpio) return false;
-  if (setCPsJalisco && setCPsJalisco[limpio]) return true; // señal primaria.
 
   const numero = parseInt(limpio, 10);
   if (isNaN(numero)) return false;
-  return numero >= MATCHING_CP_JALISCO_DESDE && numero <= MATCHING_CP_JALISCO_HASTA; // respaldo.
+  const enRango = numero >= MATCHING_CP_JALISCO_DESDE && numero <= MATCHING_CP_JALISCO_HASTA;
+  if (!enRango) return false; // obligatorio, sin excepción.
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,4 +275,16 @@ function test_esPersonaMoral() {
   if (!esPersonaMoral_('TURBOPARTES GDL, S.A. DE C.V.')) throw new Error('Debió detectar persona moral.');
   if (esPersonaMoral_('JUAN CARLOS RUIZ SIERRA')) throw new Error('No debió detectar persona moral.');
   Logger.log('test_esPersonaMoral OK.');
+}
+
+function test_esCpDeJalisco() {
+  if (!esCpDeJalisco_('44430', {})) throw new Error('44430 (Guadalajara) debió ser Jalisco.');
+  // Caso real que falló en la primera campaña (7 oct 2026): KOLBEN MOTORS,
+  // CP 37290 = León, Guanajuato, coló porque el propio pull de DENUE con
+  // entidad=Jalisco trajo ese CP de todos modos (dato inconsistente).
+  if (esCpDeJalisco_('37290', { '37290': true })) {
+    throw new Error('37290 (León, Gto.) NO debió pasar aunque esté en el set de DENUE — el rango manda.');
+  }
+  if (esCpDeJalisco_('37290', {})) throw new Error('37290 fuera de rango no debió pasar.');
+  Logger.log('test_esCpDeJalisco OK.');
 }

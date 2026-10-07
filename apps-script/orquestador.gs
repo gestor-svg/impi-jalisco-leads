@@ -121,7 +121,17 @@ function ejecutarArchivo1(opciones) {
     };
 
     // --- Intento 1: match contra DENUE (rápido, en memoria) ---
-    const matchDenue = buscarMatchTitularEnDenue_(titular, indiceDenue);
+    // BUG REAL corregido (7 oct 2026, primera campaña real): antes se
+    // aceptaba cualquier match de nombre sin verificar el CP del propio
+    // registro de DENUE — coló un caso real con CP de León, Guanajuato
+    // bajo un establecimiento que DENUE devolvió con entidad=Jalisco (dato
+    // inconsistente de DENUE, no se puede confiar ciegamente solo porque
+    // la búsqueda ya filtró por entidad). Ahora se exige TAMBIÉN que el CP
+    // del match pase esCpDeJalisco_ — si el nombre coincide pero el CP no
+    // es de Jalisco, NO se acepta por este camino, se cae al respaldo de
+    // MARCANET (que valida contra una fuente independiente).
+    const matchDenueBruto = buscarMatchTitularEnDenue_(titular, indiceDenue);
+    const matchDenue = (matchDenueBruto && esCpDeJalisco_(matchDenueBruto.CP, setCPsJalisco)) ? matchDenueBruto : null;
     if (matchDenue) {
       agregarFilaValidada_(Object.assign({}, base, {
         fecha_concesion: '',
