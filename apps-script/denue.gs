@@ -1,0 +1,807 @@
+/**
+ * Copiado sin modificaciones desde el proyecto cloudrun-impi-fonetico
+ * (archivo original: apps-script/denue.gs) — es un módulo genérico de
+ * búsqueda DENUE, sin lógica de negocio propia de ese proyecto, así que se
+ * reutiliza tal cual aquí (mismo patrón ya usado en ese proyecto para
+ * impi_fonetico_COMPLETO.py). Para este proyecto, la llamada relevante es
+ * buscarDenue({ entidad: 'Jalisco', estrato: [4, 5] }) — SIN "giro", porque
+ * el filtro de giro/industria ya lo aporta la Clase de Niza elegida en
+ * MARCia, no hace falta duplicarlo aquí (decisión del 6 oct 2026).
+ *
+ * Módulo DENUE — Apps Script (Capa 2 del pipeline)
+ * ==================================================
+ * Funciones de búsqueda contra el API público de DENUE (INEGI), soportando
+ * combinaciones de: giro, código postal, colonia, tamaño de empresa (estrato)
+ * y entidad/municipio.
+ *
+ * Hallazgos empíricos (validados contra el API real el 11 ago 2026, NO solo
+ * documentación) que corrigen supuestos anteriores del proyecto:
+ *
+ * 1. ESTRATOS REALES: el API tiene 7 estratos, no 6. La franja "31-100"
+ *    documentada originalmente en realidad son DOS franjas separadas:
+ *    31-50 (estrato 4) y 51-100 (estrato 5). Ver ESTRATOS abajo.
+ *
+ * 2. BÚSQUEDA PURA POR TAMAÑO (sin giro): funciona pasando "0" como texto
+ *    de búsqueda (Nombre) en BuscarAreaActEstr, con Sector/Subsector/Rama/
+ *    Clase también en "0". Confirmado con estrato 7 (251+) en Jalisco —
+ *    regresó resultados de rubros mixtos (panificación, seguridad, retail),
+ *    tal como se esperaba de una búsqueda sin filtro de actividad.
+ *
+ * 3. CP Y COLONIA NO SON PARÁMETROS DE BÚSQUEDA DEL API: ni el método
+ *    "Buscar" ni "BuscarEntidad" matchean código postal o colonia como
+ *    texto de "condición" — solo matchean nombre comercial, razón social,
+ *    calle, clase de actividad, estado/municipio/localidad. CP y Colonia
+ *    SÍ vienen en cada registro de respuesta, pero para "buscar por CP" o
+ *    "buscar por colonia" hay que traer un universo más amplio (por giro
+ *    y/o entidad/municipio) y FILTRAR DEL LADO DEL CLIENTE comparando esos
+ *    campos — no hay atajo del lado del servidor. Ver filtrarPorCP() y
+ *    filtrarPorColonia() abajo.
+ *
+ * 4. Sin tope bajo de registros por llamada: se probó pedir 3000 registros
+ *    de "panadería" en Jalisco y regresó el total real (1977), no un cap
+ *    artificial. Aun así, se pagina en bloques para evitar timeouts de
+ *    Apps Script (límite de 6 min de ejecución).
+ *
+ * 5. ESTRATOS AGREGADOS (rangos combinados, ej. "11 a 50 empleados"): el
+ *    API NO acepta lista ni rango de estratos en una sola llamada (se
+ *    probó "3,4" y "3-4" como valor de estrato — ambos regresan vacío, sin
+ *    error). buscarDenue() soporta esto del lado del cliente: si "estrato"
+ *    es un arreglo (ej. [3, 4]), hace una llamada por cada valor y
+ *    junta/deduplica los resultados por Id.
+ *    LÍMITE IMPORTANTE: DENUE no expone el número de empleados como dato
+ *    crudo, solo la etiqueta ya agrupada por banda (ej. "51 a 100
+ *    personas") — no se puede cortar en un número arbitrario dentro de una
+ *    banda (ej. "hasta 60 empleados" trae TODA la banda 51-100, no se
+ *    puede excluir 61-100 porque ese dato no existe en la respuesta).
+ */
+
+// ---------------------------------------------------------------------------
+// Configuración
+// ---------------------------------------------------------------------------
+
+// Token de baja sensibilidad (sin facturación asociada), documentado en
+// CLAUDE.md. Se deja aquí por simplicidad; si se comparte el proyecto más
+// ampliamente, mover a PropertiesService y regenerar el token.
+const DENUE_TOKEN = '4c4a0d49-8ac5-40a3-a848-acff580e731a';
+const DENUE_BASE_URL = 'https://www.inegi.org.mx/app/api/denue/v1/consulta';
+
+// Tamaño de bloque por llamada al paginar (balance entre # de llamadas y
+// riesgo de timeout — Apps Script tiene 6 min de límite de ejecución total).
+const DENUE_TAMANO_BLOQUE = 500;
+
+// Franjas de tamaño de empresa — CORREGIDO tras validación empírica.
+// El valor 0 = todos los tamaños (no filtra por estrato).
+const ESTRATOS = {
+  0: 'Todos los tamaños',
+  1: '0 a 5 personas',
+  2: '6 a 10 personas',
+  3: '11 a 30 personas',
+  4: '31 a 50 personas',
+  5: '51 a 100 personas',
+  6: '101 a 250 personas',
+  7: '251 y más personas',
+};
+
+// Catálogo COMPLETO de las 32 entidades federativas — reemplaza la lista
+// parcial de 8 estados (17 ago 2026). Fuente: catálogo abierto de INEGI
+// (claves de entidades/municipios) que el usuario consiguió y se validó
+// cruzando cada clave contra su capital conocida (ej. clave 14 -> 125
+// municipios, capital Guadalajara -> confirma Jalisco; clave 20 -> 570
+// municipios -> confirma Oaxaca, el estado con más municipios del país).
+// ENTIDADES_LISTA es la fuente única para el dropdown (Pantalla 1/4);
+// ENTIDADES (nombre normalizado -> código) se construye a partir de ella
+// más alias comunes, y sigue siendo la que usa resolverEntidad_().
+const ENTIDADES_LISTA = [
+  { codigo: 1, nombre: 'Aguascalientes' },
+  { codigo: 2, nombre: 'Baja California' },
+  { codigo: 3, nombre: 'Baja California Sur' },
+  { codigo: 4, nombre: 'Campeche' },
+  { codigo: 5, nombre: 'Coahuila' },
+  { codigo: 6, nombre: 'Colima' },
+  { codigo: 7, nombre: 'Chiapas' },
+  { codigo: 8, nombre: 'Chihuahua' },
+  { codigo: 9, nombre: 'Ciudad de México' },
+  { codigo: 10, nombre: 'Durango' },
+  { codigo: 11, nombre: 'Guanajuato' },
+  { codigo: 12, nombre: 'Guerrero' },
+  { codigo: 13, nombre: 'Hidalgo' },
+  { codigo: 14, nombre: 'Jalisco' },
+  { codigo: 15, nombre: 'Estado de México' },
+  { codigo: 16, nombre: 'Michoacán' },
+  { codigo: 17, nombre: 'Morelos' },
+  { codigo: 18, nombre: 'Nayarit' },
+  { codigo: 19, nombre: 'Nuevo León' },
+  { codigo: 20, nombre: 'Oaxaca' },
+  { codigo: 21, nombre: 'Puebla' },
+  { codigo: 22, nombre: 'Querétaro' },
+  { codigo: 23, nombre: 'Quintana Roo' },
+  { codigo: 24, nombre: 'San Luis Potosí' },
+  { codigo: 25, nombre: 'Sinaloa' },
+  { codigo: 26, nombre: 'Sonora' },
+  { codigo: 27, nombre: 'Tabasco' },
+  { codigo: 28, nombre: 'Tamaulipas' },
+  { codigo: 29, nombre: 'Tlaxcala' },
+  { codigo: 30, nombre: 'Veracruz' },
+  { codigo: 31, nombre: 'Yucatán' },
+  { codigo: 32, nombre: 'Zacatecas' },
+];
+
+const ENTIDADES = {};
+ENTIDADES_LISTA.forEach(function (e) { ENTIDADES[normalizarTexto_(e.nombre)] = e.codigo; });
+// Alias comunes que no coinciden con el nombre oficial de la lista de arriba.
+ENTIDADES['CDMX'] = 9;
+ENTIDADES['DISTRITO FEDERAL'] = 9;
+ENTIDADES['DF'] = 9;
+ENTIDADES['EDOMEX'] = 15;
+ENTIDADES['MEXICO'] = 15; // ojo: "México" normalizado ya cae en Estado de México, no en el país.
+
+// Catálogo COMPLETO de municipios por entidad (2,478 registros) — misma
+// fuente que ENTIDADES_LISTA. Clave de primer nivel = código de entidad
+// (número, sin ceros a la izquierda, coincide con ENTIDADES_LISTA/
+// resolverEntidad_). Clave de segundo nivel = código de municipio TAL
+// CUAL lo espera el API (string de 3 dígitos con ceros a la izquierda,
+// ej. "001", "039", "120") — NO convertir a número, se pierde el cero a
+// la izquierda (mismo bug ya documentado en el hallazgo del campo
+// Municipio de Pantalla 1, sección 12 de Claude.md).
+﻿const MUNICIPIOS = {
+  1: {"001":"Aguascalientes","002":"Asientos","003":"Calvillo","004":"Cosío","005":"Jesús María","006":"Pabellón de Arteaga","007":"Rincón de Romos","008":"San José de Gracia","009":"Tepezalá","010":"El Llano","011":"San Francisco de los Romo"},
+  2: {"001":"Ensenada","002":"Mexicali","003":"Tecate","004":"Tijuana","005":"Playas de Rosarito","006":"San Quintín","007":"San Felipe"},
+  3: {"001":"Comondú","002":"Mulegé","003":"La Paz","008":"Los Cabos","009":"Loreto"},
+  4: {"001":"Calkiní","002":"Campeche","003":"Carmen","004":"Champotón","005":"Hecelchakán","006":"Hopelchén","007":"Palizada","008":"Tenabo","009":"Escárcega","010":"Calakmul","011":"Candelaria","012":"Seybaplaya","013":"Dzitbalché"},
+  5: {"001":"Abasolo","002":"Acuña","003":"Allende","004":"Arteaga","005":"Candela","006":"Castaños","007":"Cuatro Ciénegas","008":"Escobedo","009":"Francisco I. Madero","010":"Frontera","011":"General Cepeda","012":"Guerrero","013":"Hidalgo","014":"Jiménez","015":"Juárez","016":"Lamadrid","017":"Matamoros","018":"Monclova","019":"Morelos","020":"Múzquiz","021":"Nadadores","022":"Nava","023":"Ocampo","024":"Parras","025":"Piedras Negras","026":"Progreso","027":"Ramos Arizpe","028":"Sabinas","029":"Sacramento","030":"Saltillo","031":"San Buenaventura","032":"San Juan de Sabinas","033":"San Pedro","034":"Sierra Mojada","035":"Torreón","036":"Viesca","037":"Villa Unión","038":"Zaragoza"},
+  6: {"001":"Armería","002":"Colima","003":"Comala","004":"Coquimatlán","005":"Cuauhtémoc","006":"Ixtlahuacán","007":"Manzanillo","008":"Minatitlán","009":"Tecomán","010":"Villa de Álvarez"},
+  7: {"001":"Acacoyagua","002":"Acala","003":"Acapetahua","004":"Altamirano","005":"Amatán","006":"Amatenango de la Frontera","007":"Amatenango del Valle","008":"Ángel Albino Corzo","009":"Arriaga","010":"Bejucal de Ocampo","011":"Bella Vista","012":"Berriozábal","013":"Bochil","014":"El Bosque","015":"Cacahoatán","016":"Catazajá","017":"Cintalapa de Figueroa","018":"Coapilla","019":"Comitán de Domínguez","020":"La Concordia","021":"Copainalá","022":"Chalchihuitán","023":"Chamula","024":"Chanal","025":"Chapultenango","026":"Chenalhó","027":"Chiapa de Corzo","028":"Chiapilla","029":"Chicoasén","030":"Chicomuselo","031":"Chilón","032":"Escuintla","033":"Francisco León","034":"Frontera Comalapa","035":"Frontera Hidalgo","036":"La Grandeza","037":"Huehuetán","038":"Huixtán","039":"Huitiupán","040":"Huixtla","041":"La Independencia","042":"Ixhuatán","043":"Ixtacomitán","044":"Ixtapa","045":"Ixtapangajoya","046":"Jiquipilas","047":"Jitotol","048":"Juárez","049":"Larráinzar","050":"La Libertad","051":"Mapastepec","052":"Las Margaritas","053":"Mazapa de Madero","054":"Mazatán","055":"Metapa","056":"Mitontic","057":"Motozintla","058":"Nicolás Ruíz","059":"Ocosingo","060":"Ocotepec","061":"Ocozocoautla de Espinosa","062":"Ostuacán","063":"Osumacinta","064":"Oxchuc","065":"Palenque","066":"Pantelhó","067":"Pantepec","068":"Pichucalco","069":"Pijijiapan","070":"El Porvenir","071":"Villa Comaltitlán","072":"Pueblo Nuevo Solistahuacán","073":"Rayón","074":"Reforma","075":"Las Rosas","076":"Sabanilla","077":"Salto de Agua","078":"San Cristóbal de las Casas","079":"San Fernando","080":"Siltepec","081":"Simojovel","082":"Sitalá","083":"Socoltenango","084":"Solosuchiapa","085":"Soyaló","086":"Suchiapa","087":"Suchiate","088":"Sunuapa","089":"Tapachula","090":"Tapalapa","091":"Tapilula","092":"Tecpatán","093":"Tenejapa","094":"Teopisca","096":"Tila","097":"Tonalá","098":"Totolapa","099":"La Trinitaria","100":"Tumbalá","101":"Tuxtla Gutiérrez","102":"Tuxtla Chico","103":"Tuzantán","104":"Tzimol","105":"Unión Juárez","106":"Venustiano Carranza","107":"Villa Corzo","108":"Villaflores","109":"Yajalón","110":"San Lucas","111":"Zinacantán","112":"San Juan Cancuc","113":"Aldama","114":"Benemérito de las Américas","115":"Maravilla Tenejapa","116":"Marqués de Comillas","117":"Montecristo de Guerrero","118":"San Andrés Duraznal","119":"Santiago el Pinar","120":"Capitán Luis Ángel Vidal","121":"Rincón Chamula San Pedro","122":"El Parral","123":"Emiliano Zapata","124":"Mezcalapa","125":"Honduras de la Sierra"},
+  8: {"001":"Ahumada","002":"Aldama","003":"Allende","004":"Aquiles Serdán","005":"Ascensión","006":"Bachíniva","007":"Balleza","008":"Batopilas de Manuel Gómez Morín","009":"Bocoyna","010":"Buenaventura","011":"Camargo","012":"Carichí","013":"Casas Grandes","014":"Coronado","015":"Coyame del Sotol","016":"La Cruz","017":"Cuauhtémoc","018":"Cusihuiriachi","019":"Chihuahua","020":"Chínipas","021":"Delicias","022":"Dr. Belisario Domínguez","023":"Galeana","024":"Santa Isabel","025":"Gómez Farías","026":"Gran Morelos","027":"Guachochi","028":"Guadalupe","029":"Guadalupe y Calvo","030":"Guazapares","031":"Guerrero","032":"Hidalgo del Parral","033":"Huejotitán","034":"Ignacio Zaragoza","035":"Janos","036":"Jiménez","037":"Juárez","038":"Julimes","039":"López","040":"Madera","041":"Maguarichi","042":"Manuel Benavides","043":"Matachí","044":"Matamoros","045":"Meoqui","046":"Morelos","047":"Moris","048":"Namiquipa","049":"Nonoava","050":"Nuevo Casas Grandes","051":"Ocampo","052":"Ojinaga","053":"Praxedis G. Guerrero","054":"Riva Palacio","055":"Rosales","056":"Valle del Rosario","057":"San Francisco de Borja","058":"San Francisco de Conchos","059":"San Francisco del Oro","060":"Santa Bárbara","061":"Satevó","062":"Saucillo","063":"Temósachic","064":"El Tule","065":"Urique","066":"Uruachi","067":"Valle de Zaragoza"},
+  9: {"002":"Azcapotzalco","003":"Coyoacán","004":"Cuajimalpa de Morelos","005":"Gustavo A. Madero","006":"Iztacalco","007":"Iztapalapa","008":"La Magdalena Contreras","009":"Milpa Alta","010":"Álvaro Obregón","011":"Tláhuac","012":"Tlalpan","013":"Xochimilco","014":"Benito Juárez","015":"Cuauhtémoc","016":"Miguel Hidalgo","017":"Venustiano Carranza"},
+  10: {"001":"Canatlán","002":"Canelas","003":"Coneto de Comonfort","004":"Cuencamé","005":"Durango","006":"General Simón Bolívar","007":"Gómez Palacio","008":"Guadalupe Victoria","009":"Guanaceví","010":"Hidalgo","011":"Indé","012":"Lerdo","013":"Mapimí","014":"Mezquital","015":"Nazas","016":"Nombre de Dios","017":"Ocampo","018":"El Oro","019":"Otáez","020":"Pánuco de Coronado","021":"Peñón Blanco","022":"Poanas","023":"Pueblo Nuevo","024":"Rodeo","025":"San Bernardo","026":"San Dimas","027":"San Juan de Guadalupe","028":"San Juan del Río","029":"San Luis del Cordero","030":"San Pedro del Gallo","031":"Santa Clara","032":"Santiago Papasquiaro","033":"Súchil","034":"Tamazula","035":"Tepehuanes","036":"Tlahualilo","037":"Topia","038":"Vicente Guerrero","039":"Nuevo Ideal"},
+  11: {"001":"Abasolo","002":"Acámbaro","003":"San Miguel de Allende","004":"Apaseo el Alto","005":"Apaseo el Grande","006":"Atarjea","007":"Celaya","008":"Manuel Doblado","009":"Comonfort","010":"Coroneo","011":"Cortazar","012":"Cuerámaro","013":"Doctor Mora","014":"Dolores Hidalgo Cuna de la Independencia Nacional","015":"Guanajuato","016":"Huanímaro","017":"Irapuato","018":"Jaral del Progreso","019":"Jerécuaro","020":"León","021":"Moroleón","022":"Ocampo","023":"Pénjamo","024":"Pueblo Nuevo","025":"Purísima del Rincón","026":"Romita","027":"Salamanca","028":"Salvatierra","029":"San Diego de la Unión","030":"San Felipe","031":"San Francisco del Rincón","032":"San José de Iturbide","033":"San Luis de la Paz","034":"Santa Catarina","035":"Santa Cruz de Juventino Rosas","036":"Santiago Maravatío","037":"Silao de la Victoria","038":"Tarandacuao","039":"Tarimoro","040":"Tierra Blanca","041":"Uriangato","042":"Valle de Santiago","043":"Victoria","044":"Villagrán","045":"Xichú","046":"Yuriria"},
+  12: {"001":"Acapulco de Juárez","002":"Ahuacuotzingo","003":"Ajuchitlán del Progreso","004":"Alcozauca de Guerrero","005":"Alpoyeca","006":"Apaxtla de Castrejón","007":"Arcelia","008":"Atenango del Río","009":"Atlamajalcingo del Monte","010":"Atlixtac","011":"Atoyac de Álvarez","012":"Ayutla de los Libres","013":"Azoyú","014":"Benito Juárez","015":"Buenavista de Cuéllar","016":"Coahuayutla de José María Izazaga","017":"Cocula","018":"Copala","019":"Copalillo","020":"Copanatoyac","021":"Coyuca de Benítez","022":"Coyuca de Catalán","023":"Cuajinicuilapa","024":"Cualác","025":"Cuautepec","026":"Cuetzala del Progreso","027":"Cutzamala de Pinzón","028":"Chilapa de Álvarez","029":"Chilpancingo de los Bravo","030":"Florencio Villarreal","031":"General Canuto A. Neri","032":"General Heliodoro Castillo","033":"Huamuxtitlán","034":"Huitzuco de los Figueroa","035":"Iguala de la Independencia","036":"Igualapa","037":"Ixcateopan de Cuauhtémoc","038":"Zihuatanejo de Azueta","039":"Juan R. Escudero","040":"Leonardo Bravo","041":"Malinaltepec","042":"Mártir de Cuilapan","043":"Metlatónoc","044":"Mochitlán","045":"Olinalá","046":"Ometepec","047":"Pedro Ascencio Alquisiras","048":"Petatlán","049":"Pilcaya","050":"Pungarabato","051":"Quechultenango","052":"San Luis Acatlán","053":"San Marcos","054":"San Miguel Totolapan","055":"Taxco de Alarcón","056":"Tecoanapa","057":"Técpan de Galeana","058":"Teloloapan","059":"Tepecoacuilco de Trujano","060":"Tetipac","061":"Tixtla de Guerrero","062":"Tlacoachistlahuaca","063":"Tlacoapa","064":"Tlalchapa","065":"Tlalixtaquilla de Maldonado","066":"Tlapa de Comonfort","067":"Tlapehuala","068":"La Unión de Isidoro Montes de Oca","069":"Xalpatláhuac","070":"Xochihuehuetlán","071":"Xochistlahuaca","072":"Zapotitlán Tablas","073":"Zirándaro","074":"Zitlala","075":"Eduardo Neri","076":"Acatepec","077":"Marquelia","078":"Cochoapa el Grande","079":"José Joaquín de Herrera","080":"Juchitán","081":"Iliatenco","082":"Las Vigas","083":"Ñuu Savi","084":"Santa Cruz del Rincón","085":"San Nicolás"},
+  13: {"001":"Acatlán","002":"Acaxochitlán","003":"Actopan","004":"Agua Blanca de Iturbide","005":"Ajacuba","006":"Alfajayucan","007":"Almoloya","008":"Apan","009":"El Arenal","010":"Atitalaquia","011":"Atlapexco","012":"Atotonilco el Grande","013":"Atotonilco de Tula","014":"Calnali","015":"Cardonal","016":"Cuautepec de Hinojosa","017":"Chapantongo","018":"Chapulhuacán","019":"Chilcuautla","020":"Eloxochitlán","021":"Emiliano Zapata","022":"Epazoyucan","023":"Francisco I. Madero","024":"Huasca de Ocampo","025":"Huautla","026":"Huazalingo","027":"Huehuetla","028":"Huejutla de Reyes","029":"Huichapan","030":"Ixmiquilpan","031":"Jacala de Ledezma","032":"Jaltocán","033":"Juárez Hidalgo","034":"Lolotla","035":"Metepec","036":"San Agustín Metzquititlán","037":"Metztitlán","038":"Mineral del Chico","039":"Mineral del Monte","040":"La Misión","041":"Mixquiahuala de Juárez","042":"Molango de Escamilla","043":"Nicolás Flores","044":"Nopala de Villagrán","045":"Omitlán de Juárez","046":"San Felipe Orizatlán","047":"Pacula","048":"Pachuca de Soto","049":"Pisaflores","050":"Progreso de Obregón","051":"Mineral de la Reforma","052":"San Agustín Tlaxiaca","053":"San Bartolo Tutotepec","054":"San Salvador","055":"Santiago de Anaya","056":"Santiago Tulantepec de Lugo Guerrero","057":"Singuilucan","058":"Tasquillo","059":"Tecozautla","060":"Tenango de Doria","061":"Tepeapulco","062":"Tepehuacán de Guerrero","063":"Tepeji del Río de Ocampo","064":"Tepetitlán","065":"Tetepango","066":"Villa de Tezontepec","067":"Tezontepec de Aldama","068":"Tianguistengo","069":"Tizayuca","070":"Tlahuelilpan","071":"Tlahuiltepa","072":"Tlanalapa","073":"Tlanchinol","074":"Tlaxcoapan","075":"Tolcayuca","076":"Tula de Allende","077":"Tulancingo de Bravo","078":"Xochiatipan","079":"Xochicoatlán","080":"Yahualica","081":"Zacualtipán de Ángeles","082":"Zapotlán de Juárez","083":"Zempoala","084":"Zimapán"},
+  14: {"001":"Acatic","002":"Acatlán de Juárez","003":"Ahualulco de Mercado","004":"Amacueca","005":"Amatitán","006":"Ameca","007":"San Juanito de Escobedo","008":"Arandas","009":"El Arenal","010":"Atemajac de Brizuela","011":"Atengo","012":"Atenguillo","013":"Atotonilco el Alto","014":"Atoyac","015":"Autlán de Navarro","016":"Ayotlán","017":"Ayutla","018":"La Barca","019":"Bolaños","020":"Cabo Corrientes","021":"Casimiro Castillo","022":"Cihuatlán","023":"Zapotlán el Grande","024":"Cocula","025":"Colotlán","026":"Concepción de Buenos Aires","027":"Cuautitlán de García Barragán","028":"Cuautla","029":"Cuquío","030":"Chapala","031":"Chimaltitán","032":"Chiquilistlán","033":"Degollado","034":"Ejutla","035":"Encarnación de Díaz","036":"Etzatlán","037":"El Grullo","038":"Guachinango","039":"Guadalajara","040":"Hostotipaquillo","041":"Huejúcar","042":"Huejuquilla el Alto","043":"La Huerta","044":"Ixtlahuacán de los Membrillos","045":"Ixtlahuacán del Río","046":"Jalostotitlán","047":"Jamay","048":"Jesús María","049":"Jilotlán de los Dolores","050":"Jocotepec","051":"Juanacatlán","052":"Juchitlán","053":"Lagos de Moreno","054":"El Limón","055":"Magdalena","056":"Santa María del Oro","057":"La Manzanilla de la Paz","058":"Mascota","059":"Mazamitla","060":"Mexticacán","061":"Mezquitic","062":"Mixtlán","063":"Ocotlán","064":"Ojuelos de Jalisco","065":"Pihuamo","066":"Poncitlán","067":"Puerto Vallarta","068":"Villa Purificación","069":"Quitupan","070":"El Salto","071":"San Cristóbal de la Barranca","072":"San Diego de Alejandría","073":"San Juan de los Lagos","074":"San Julián","075":"San Marcos","076":"San Martín de Bolaños","077":"San Martín Hidalgo","078":"San Miguel el Alto","079":"Gómez Farías","080":"San Sebastián del Oeste","081":"Santa María de los Ángeles","082":"Sayula","083":"Tala","084":"Talpa de Allende","085":"Tamazula de Gordiano","086":"Tapalpa","087":"Tecalitlán","088":"Tecolotlán","089":"Techaluta de Montenegro","090":"Tenamaxtlán","091":"Teocaltiche","092":"Teocuitatlán de Corona","093":"Tepatitlán de Morelos","094":"Tequila","095":"Teuchitlán","096":"Tizapán el Alto","097":"Tlajomulco de Zúñiga","098":"San Pedro Tlaquepaque","099":"Tolimán","100":"Tomatlán","101":"Tonalá","102":"Tonaya","103":"Tonila","104":"Totatiche","105":"Tototlán","106":"Tuxcacuesco","107":"Tuxcueca","108":"Tuxpan","109":"Unión de San Antonio","110":"Unión de Tula","111":"Valle de Guadalupe","112":"Valle de Juárez","113":"San Gabriel","114":"Villa Corona","115":"Villa Guerrero","116":"Villa Hidalgo","117":"Cañadas de Obregón","118":"Yahualica de González Gallo","119":"Zacoalco de Torres","120":"Zapopan","121":"Zapotiltic","122":"Zapotitlán de Vadillo","123":"Zapotlán del Rey","124":"Zapotlanejo","125":"San Ignacio Cerro Gordo"},
+  15: {"001":"Acambay de Ruíz Castañeda","002":"Acolman","003":"Aculco","004":"Almoloya de Alquisiras","005":"Almoloya de Juárez","006":"Almoloya del Río","007":"Amanalco","008":"Amatepec","009":"Amecameca","010":"Apaxco","011":"Atenco","012":"Atizapán","013":"Atizapán de Zaragoza","014":"Atlacomulco","015":"Atlautla","016":"Axapusco","017":"Ayapango","018":"Calimaya","019":"Capulhuac","020":"Coacalco de Berriozábal","021":"Coatepec Harinas","022":"Cocotitlán","023":"Coyotepec","024":"Cuautitlán","025":"Chalco","026":"Chapa de Mota","027":"Chapultepec","028":"Chiautla","029":"Chicoloapan","030":"Chiconcuac","031":"Chimalhuacán","032":"Donato Guerra","033":"Ecatepec de Morelos","034":"Ecatzingo","035":"Huehuetoca","036":"Hueypoxtla","037":"Huixquilucan","038":"Isidro Fabela","039":"Ixtapaluca","040":"Ixtapan de la Sal","041":"Ixtapan del Oro","042":"Ixtlahuaca","043":"Xalatlaco","044":"Jaltenco","045":"Jilotepec","046":"Jilotzingo","047":"Jiquipilco","048":"Jocotitlán","049":"Joquicingo","050":"Juchitepec","051":"Lerma","052":"Malinalco","053":"Melchor Ocampo","054":"Metepec","055":"Mexicaltzingo","056":"Morelos","057":"Naucalpan de Juárez","058":"Nezahualcóyotl","059":"Nextlalpan","060":"Nicolás Romero","061":"Nopaltepec","062":"Ocoyoacac","063":"Ocuilan","064":"El Oro","065":"Otumba","066":"Otzoloapan","067":"Otzolotepec","068":"Ozumba","069":"Papalotla","070":"La Paz","071":"Polotitlán","072":"Rayón","073":"San Antonio la Isla","074":"San Felipe del Progreso","075":"San Martín de las Pirámides","076":"San Mateo Atenco","077":"San Simón de Guerrero","078":"Santo Tomás","079":"Soyaniquilpan de Juárez","080":"Sultepec","081":"Tecámac","082":"Tejupilco","083":"Temamatla","084":"Temascalapa","085":"Temascalcingo","086":"Temascaltepec","087":"Temoaya","088":"Tenancingo","089":"Tenango del Aire","090":"Tenango del Valle","091":"Teoloyucan","092":"Teotihuacán","093":"Tepetlaoxtoc","094":"Tepetlixpa","095":"Tepotzotlán","096":"Tequixquiac","097":"Texcaltitlán","098":"Texcalyacac","099":"Texcoco","100":"Tezoyuca","101":"Tianguistenco","102":"Timilpan","103":"Tlalmanalco","104":"Tlalnepantla de Baz","105":"Tlatlaya","106":"Toluca","107":"Tonatico","108":"Tultepec","109":"Tultitlán","110":"Valle de Bravo","111":"Villa de Allende","112":"Villa del Carbón","113":"Villa Guerrero","114":"Villa Victoria","115":"Xonacatlán","116":"Zacazonapan","117":"Zacualpan","118":"Zinacantepec","119":"Zumpahuacán","120":"Zumpango","121":"Cuautitlán Izcalli","122":"Valle de Chalco Solidaridad","123":"Luvianos","124":"San José del Rincón","125":"Tonanitla"},
+  16: {"001":"Acuitzio","002":"Aguililla","003":"Álvaro Obregón","004":"Angamacutiro","005":"Angangueo","006":"Apatzingán","007":"Aporo","008":"Aquila","009":"Ario","010":"Arteaga","011":"Briseñas","012":"Buenavista","013":"Carácuaro","014":"Coahuayana","015":"Coalcomán de Vázquez Pallares","016":"Coeneo","017":"Contepec","018":"Copándaro","019":"Cotija","020":"Cuitzeo","021":"Charapan","022":"Charo","023":"Chavinda","024":"Cherán","025":"Chilchota","026":"Chinicuila","027":"Chucándiro","028":"Churintzio","029":"Churumuco","030":"Ecuandureo","031":"Epitacio Huerta","032":"Erongarícuaro","033":"Gabriel Zamora","034":"Hidalgo","035":"La Huacana","036":"Huandacareo","037":"Huaniqueo","038":"Huetamo","039":"Huiramba","040":"Indaparapeo","041":"Irimbo","042":"Ixtlán","043":"Jacona","044":"Jiménez","045":"Jiquilpan","046":"Juárez","047":"Jungapeo","048":"Lagunillas","049":"Madero","050":"Maravatío","051":"Marcos Castellanos","052":"Lázaro Cárdenas","053":"Morelia","054":"Morelos","055":"Múgica","056":"Nahuatzen","057":"Nocupétaro","058":"Nuevo Parangaricutiro","059":"Nuevo Urecho","060":"Numarán","061":"Ocampo","062":"Pajacuarán","063":"Panindícuaro","064":"Parácuaro","065":"Paracho","066":"Pátzcuaro","067":"Penjamillo","068":"Peribán","069":"La Piedad","070":"Purépero","071":"Puruándiro","072":"Queréndaro","073":"Quiroga","074":"Cojumatlán de Régules","075":"Los Reyes","076":"Sahuayo","077":"San Lucas","078":"Santa Ana Maya","079":"Salvador Escalante","080":"Senguio","081":"Susupuato","082":"Tacámbaro","083":"Tancítaro","084":"Tangamandapio","085":"Tangancícuaro","086":"Tanhuato","087":"Taretan","088":"Tarímbaro","089":"Tepalcatepec","090":"Tingambato","091":"Tingüindín","092":"Tiquicheo de Nicolás Romero","093":"Tlalpujahua","094":"Tlazazalca","095":"Tocumbo","096":"Tumbiscatío","097":"Turicato","098":"Tuxpan","099":"Tuzantla","100":"Tzintzuntzan","101":"Tzitzio","102":"Uruapan","103":"Venustiano Carranza","104":"Villamar","105":"Vista Hermosa","106":"Yurécuaro","107":"Zacapu","108":"Zamora","109":"Zináparo","110":"Zinapécuaro","111":"Ziracuaretiro","112":"Zitácuaro","113":"José Sixto Verduzco"},
+  17: {"001":"Amacuzac","002":"Atlatlahucan","003":"Axochiapan","004":"Ayala","005":"Coatlán del Río","006":"Cuautla","007":"Cuernavaca","008":"Emiliano Zapata","009":"Huitzilac","010":"Jantetelco","011":"Jiutepec","012":"Jojutla","013":"Jonacatepec de Leandro Valle","014":"Mazatepec","015":"Miacatlán","016":"Ocuituco","017":"Puente de Ixtla","018":"Temixco","019":"Tepalcingo","020":"Tepoztlán","021":"Tetecala","022":"Tetela del Volcán","023":"Tlalnepantla","024":"Tlaltizapán de Zapata","025":"Tlaquiltenango","026":"Tlayacapan","027":"Totolapan","028":"Xochitepec","029":"Yautepec","030":"Yecapixtla","031":"Zacatepec","032":"Zacualpan de Amilpas","033":"Temoac","034":"Coatetelco","035":"Xoxocotla","036":"Hueyapan"},
+  18: {"001":"Acaponeta","002":"Ahuacatlán","003":"Amatlán de Cañas","004":"Compostela","005":"Huajicori","006":"Ixtlán del Río","007":"Jala","008":"Xalisco","009":"Del Nayar","010":"Rosamorada","011":"Ruiz","012":"San Blas","013":"San Pedro Lagunillas","014":"Santa María del Oro","015":"Santiago Ixcuintla","016":"Tecuala","017":"Tepic","018":"Tuxpan","019":"La Yesca","020":"Bahía de Banderas"},
+  19: {"001":"Abasolo","002":"Agualeguas","003":"Los Aldamas","004":"Allende","005":"Anáhuac","006":"Apodaca","007":"Aramberri","008":"Bustamante","009":"Cadereyta Jiménez","010":"El Carmen","011":"Cerralvo","012":"Ciénega de Flores","013":"China","014":"Doctor Arroyo","015":"Doctor Coss","016":"Doctor González","017":"Galeana","018":"García","019":"San Pedro Garza García","020":"General Bravo","021":"General Escobedo","022":"General Terán","023":"General Treviño","024":"General Zaragoza","025":"General Zuazua","026":"Guadalupe","027":"Los Herreras","028":"Higueras","029":"Hualahuises","030":"Iturbide","031":"Juárez","032":"Lampazos de Naranjo","033":"Linares","034":"Marín","035":"Melchor Ocampo","036":"Mier y Noriega","037":"Mina","038":"Montemorelos","039":"Monterrey","040":"Parás","041":"Pesquería","042":"Los Ramones","043":"Rayones","044":"Sabinas Hidalgo","045":"Salinas Victoria","046":"San Nicolás de los Garza","047":"Hidalgo","048":"Santa Catarina","049":"Santiago","050":"Vallecillo","051":"Villaldama"},
+  20: {"001":"Abejones","002":"Acatlán de Pérez Figueroa","003":"Asunción Cacalotepec","004":"Asunción Cuyotepeji","005":"Asunción Ixtaltepec","006":"Asunción Nochixtlán","007":"Asunción Ocotlán","008":"Asunción Tlacolulita","009":"Ayotzintepec","010":"El Barrio de la Soledad","011":"Calihualá","012":"Candelaria Loxicha","013":"Ciénega de Zimatlán","014":"Ciudad Ixtepec","015":"Coatecas Altas","016":"Coicoyán de las Flores","017":"La Compañía","018":"Concepción Buenavista","019":"Concepción Pápalo","020":"Constancia del Rosario","021":"Cosolapa","022":"Cosoltepec","023":"Cuilápam de Guerrero","024":"Cuyamecalco Villa de Zaragoza","025":"Chahuites","026":"Chalcatongo de Hidalgo","027":"Chiquihuitlán de Benito Juárez","028":"Heroica Ciudad de Ejutla de Crespo","029":"Eloxochitlán de Flores Magón","030":"El Espinal","031":"Tamazulápam del Espíritu Santo","032":"Fresnillo de Trujano","033":"Guadalupe Etla","034":"Guadalupe de Ramírez","035":"Guelatao de Juárez","036":"Guevea de Humboldt","037":"Mesones Hidalgo","038":"Villa Hidalgo Yalálag","039":"Heroica Ciudad de Huajuapan de León","040":"Huautepec","041":"Huautla de Jiménez","042":"Ixtlán de Juárez","043":"Juchitán de Zaragoza","044":"Loma Bonita","045":"Magdalena Apazco","046":"Magdalena Jaltepec","047":"Santa Magdalena Jicotlán","048":"Magdalena Mixtepec","049":"Magdalena Ocotlán","050":"Magdalena Peñasco","051":"Magdalena Teitipac","052":"Magdalena Tequisistlán","053":"Magdalena Tlacotepec","054":"Magdalena Zahuatlán","055":"Mariscala de Juárez","056":"Mártires de Tacubaya","057":"Matías Romero Avendaño","058":"Mazatlán Villa de Flores","059":"Miahuatlán de Porfirio Díaz","060":"Mixistlán de la Reforma","061":"Monjas","062":"Natividad","063":"Nazareno Etla","064":"Nejapa de Madero","065":"Ixpantepec Nieves","066":"Santiago Niltepec","067":"Oaxaca de Juárez","068":"Ocotlán de Morelos","069":"La Pe","070":"Pinotepa de Don Luis","071":"Pluma Hidalgo","072":"San José del Progreso","073":"Putla Villa de Guerrero","074":"Santa Catarina Quioquitani","075":"Reforma de Pineda","076":"La Reforma","077":"Reyes Etla","078":"Rojas de Cuauhtémoc","079":"Salina Cruz","080":"San Agustín Amatengo","081":"San Agustín Atenango","082":"San Agustín Chayuco","083":"San Agustín de las Juntas","084":"San Agustín Etla","085":"San Agustín Loxicha","086":"San Agustín Tlacotepec","087":"San Agustín Yatareni","088":"San Andrés Cabecera Nueva","089":"San Andrés Dinicuiti","090":"San Andrés Huaxpaltepec","091":"San Andrés Huayápam","092":"San Andrés Ixtlahuaca","093":"San Andrés Lagunas","094":"San Andrés Nuxiño","095":"San Andrés Paxtlán","096":"San Andrés Sinaxtla","097":"San Andrés Solaga","098":"San Andrés Teotilálpam","099":"San Andrés Tepetlapa","100":"San Andrés Yaá","101":"San Andrés Zabache","102":"San Andrés Zautla","103":"San Antonino Castillo Velasco","104":"San Antonino el Alto","105":"San Antonino Monte Verde","106":"San Antonio Acutla","107":"San Antonio de la Cal","108":"San Antonio Huitepec","109":"San Antonio Nanahuatípam","110":"San Antonio Sinicahua","111":"San Antonio Tepetlapa","112":"San Baltazar Chichicápam","113":"San Baltazar Loxicha","114":"San Baltazar Yatzachi el Bajo","115":"San Bartolo Coyotepec","116":"San Bartolomé Ayautla","117":"San Bartolomé Loxicha","118":"San Bartolomé Quialana","119":"San Bartolomé Yucuañe","120":"San Bartolomé Zoogocho","121":"San Bartolo Soyaltepec","122":"San Bartolo Yautepec","123":"San Bernardo Mixtepec","124":"Heroica Villa de San Blas Atempa","125":"San Carlos Yautepec","126":"San Cristóbal Amatlán","127":"San Cristóbal Amoltepec","128":"San Cristóbal Lachirioag","129":"San Cristóbal Suchixtlahuaca","130":"San Dionisio del Mar","131":"San Dionisio Ocotepec","132":"San Dionisio Ocotlán","133":"San Esteban Atatlahuca","134":"San Felipe Jalapa de Díaz","135":"San Felipe Tejalápam","136":"San Felipe Usila","137":"San Francisco Cahuacuá","138":"San Francisco Cajonos","139":"San Francisco Chapulapa","140":"San Francisco Chindúa","141":"San Francisco del Mar","142":"San Francisco Huehuetlán","143":"San Francisco Ixhuatán","144":"San Francisco Jaltepetongo","145":"San Francisco Lachigoló","146":"San Francisco Logueche","147":"San Francisco Nuxaño","148":"San Francisco Ozolotepec","149":"San Francisco Sola","150":"San Francisco Telixtlahuaca","151":"San Francisco Teopan","152":"San Francisco Tlapancingo","153":"San Gabriel Mixtepec","154":"San Ildefonso Amatlán","155":"San Ildefonso Sola","156":"San Ildefonso Villa Alta","157":"San Jacinto Amilpas","158":"San Jacinto Tlacotepec","159":"San Jerónimo Coatlán","160":"San Jerónimo Silacayoapilla","161":"San Jerónimo Sosola","162":"San Jerónimo Taviche","163":"San Jerónimo Tecóatl","164":"San Jorge Nuchita","165":"San José Ayuquila","166":"San José Chiltepec","167":"San José del Peñasco","168":"San José Estancia Grande","169":"San José Independencia","170":"San José Lachiguiri","171":"San José Tenango","172":"San Juan Achiutla","173":"San Juan Atepec","174":"Ánimas Trujano","175":"San Juan Bautista Atatlahuca","176":"San Juan Bautista Coixtlahuaca","177":"San Juan Bautista Cuicatlán","178":"San Juan Bautista Guelache","179":"San Juan Bautista Jayacatlán","180":"San Juan Bautista Lo de Soto","181":"San Juan Bautista Suchitepec","182":"San Juan Bautista Tlacoatzintepec","183":"San Juan Bautista Tlachichilco","184":"San Juan Bautista Tuxtepec","185":"San Juan Cacahuatepec","186":"San Juan Cieneguilla","187":"San Juan Coatzóspam","188":"San Juan Colorado","189":"San Juan Comaltepec","190":"San Juan Cotzocón","191":"San Juan Chicomezúchil","192":"San Juan Chilateca","193":"San Juan del Estado","194":"San Juan del Río","195":"San Juan Diuxi","196":"San Juan Evangelista Analco","197":"San Juan Guelavía","198":"San Juan Guichicovi","199":"San Juan Ihualtepec","200":"San Juan Juquila Mixes","201":"San Juan Juquila Vijanos","202":"San Juan Lachao","203":"San Juan Lachigalla","204":"San Juan Lajarcia","205":"San Juan Lalana","206":"San Juan de los Cués","207":"San Juan Mazatlán","208":"San Juan Mixtepec -Dto. 08 -","209":"San Juan Mixtepec -Dto. 26 -","210":"San Juan Ñumí","211":"San Juan Ozolotepec","212":"San Juan Petlapa","213":"San Juan Quiahije","214":"San Juan Quiotepec","215":"San Juan Sayultepec","216":"San Juan Tabaá","217":"San Juan Tamazola","218":"San Juan Teita","219":"San Juan Teitipac","220":"San Juan Tepeuxila","221":"San Juan Teposcolula","222":"San Juan Yaeé","223":"San Juan Yatzona","224":"San Juan Yucuita","225":"San Lorenzo","226":"San Lorenzo Albarradas","227":"San Lorenzo Cacaotepec","228":"San Lorenzo Cuaunecuiltitla","229":"San Lorenzo Texmelúcan","230":"San Lorenzo Victoria","231":"San Lucas Camotlán","232":"San Lucas Ojitlán","233":"San Lucas Quiaviní","234":"San Lucas Zoquiápam","235":"San Luis Amatlán","236":"San Marcial Ozolotepec","237":"San Marcos Arteaga","238":"Heroico San Martín de los Cansecos","239":"San Martín Huamelúlpam","240":"San Martín Itunyoso","241":"San Martín Lachilá","242":"San Martín Peras","243":"San Martín Tilcajete","244":"San Martín Toxpalan","245":"San Martín Zacatepec","246":"San Mateo Cajonos","247":"Capulálpam de Méndez","248":"San Mateo del Mar","249":"San Mateo Yoloxochitlán","250":"San Mateo Etlatongo","251":"San Mateo Nejápam","252":"San Mateo Peñasco","253":"San Mateo Piñas","254":"San Mateo Río Hondo","255":"San Mateo Sindihui","256":"San Mateo Tlapiltepec","257":"San Melchor Betaza","258":"San Miguel Achiutla","259":"San Miguel Ahuehuetitlán","260":"San Miguel Aloápam","261":"San Miguel Amatitlán","262":"San Miguel Amatlán","263":"San Miguel Coatlán","264":"San Miguel Chicahua","265":"San Miguel Chimalapa","266":"San Miguel del Puerto","267":"San Miguel del Río","268":"San Miguel Ejutla","269":"San Miguel el Grande","270":"San Miguel Huautla","271":"San Miguel Mixtepec","272":"San Miguel Panixtlahuaca","273":"San Miguel Peras","274":"San Miguel Piedras","275":"San Miguel Quetzaltepec","276":"San Miguel Santa Flor","277":"Villa Sola de Vega","278":"San Miguel Soyaltepec","279":"San Miguel Suchixtepec","280":"Villa Talea de Castro","281":"San Miguel Tecomatlán","282":"San Miguel Tenango","283":"San Miguel Tequixtepec","284":"San Miguel Tilquiápam","285":"San Miguel Tlacamama","286":"San Miguel Tlacotepec","287":"San Miguel Tulancingo","288":"San Miguel Yotao","289":"San Nicolás","290":"San Nicolás Hidalgo","291":"San Pablo Coatlán","292":"San Pablo Cuatro Venados","293":"San Pablo Etla","294":"San Pablo Huitzo","295":"San Pablo Huixtepec","296":"San Pablo Macuiltianguis","297":"San Pablo Tijaltepec","298":"San Pablo Villa de Mitla","299":"San Pablo Yaganiza","300":"San Pedro Amuzgos","301":"San Pedro Apóstol","302":"San Pedro Atoyac","303":"San Pedro Cajonos","304":"San Pedro Coxcaltepec Cántaros","305":"San Pedro Comitancillo","306":"San Pedro el Alto","307":"San Pedro Huamelula","308":"San Pedro Huilotepec","309":"San Pedro Ixcatlán","310":"San Pedro Ixtlahuaca","311":"San Pedro Jaltepetongo","312":"San Pedro Jicayán","313":"San Pedro Jocotipac","314":"San Pedro Juchatengo","315":"San Pedro Mártir","316":"San Pedro Mártir Quiechapa","317":"San Pedro Mártir Yucuxaco","318":"San Pedro Mixtepec -Dto. 22 -","319":"San Pedro Mixtepec -Dto. 26 -","320":"San Pedro Molinos","321":"San Pedro Nopala","322":"San Pedro Ocopetatillo","323":"San Pedro Ocotepec","324":"San Pedro Pochutla","325":"San Pedro Quiatoni","326":"San Pedro Sochiápam","327":"San Pedro Tapanatepec","328":"San Pedro Taviche","329":"San Pedro Teozacoalco","330":"San Pedro Teutila","331":"San Pedro Tidaá","332":"San Pedro Topiltepec","333":"San Pedro Totolápam","334":"Villa de Tututepec","335":"San Pedro Yaneri","336":"San Pedro Yólox","337":"San Pedro y San Pablo Ayutla","338":"Villa de Etla","339":"San Pedro y San Pablo Teposcolula","340":"San Pedro y San Pablo Tequixtepec","341":"San Pedro Yucunama","342":"San Raymundo Jalpan","343":"San Sebastián Abasolo","344":"San Sebastián Coatlán","345":"San Sebastián Ixcapa","346":"San Sebastián Nicananduta","347":"San Sebastián Río Hondo","348":"San Sebastián Tecomaxtlahuaca","349":"San Sebastián Teitipac","350":"San Sebastián Tutla","351":"San Simón Almolongas","352":"San Simón Zahuatlán","353":"Santa Ana","354":"Santa Ana Ateixtlahuaca","355":"Santa Ana Cuauhtémoc","356":"Santa Ana del Valle","357":"Santa Ana Tavela","358":"Santa Ana Tlapacoyan","359":"Santa Ana Yareni","360":"Santa Ana Zegache","361":"Santa Catalina Quierí","362":"Santa Catarina Cuixtla","363":"Santa Catarina Ixtepeji","364":"Santa Catarina Juquila","365":"Santa Catarina Lachatao","366":"Santa Catarina Loxicha","367":"Santa Catarina Mechoacán","368":"Santa Catarina Minas","369":"Santa Catarina Quiané","370":"Santa Catarina Tayata","371":"Santa Catarina Ticuá","372":"Santa Catarina Yosonotú","373":"Santa Catarina Zapoquila","374":"Santa Cruz Acatepec","375":"Santa Cruz Amilpas","376":"Santa Cruz de Bravo","377":"Santa Cruz Itundujia","378":"Santa Cruz Mixtepec","379":"Santa Cruz Nundaco","380":"Santa Cruz Papalutla","381":"Santa Cruz Tacache de Mina","382":"Santa Cruz Tacahua","383":"Santa Cruz Tayata","384":"Santa Cruz Xitla","385":"Santa Cruz Xoxocotlán","386":"Santa Cruz Zenzontepec","387":"Santa Gertrudis","388":"Santa Inés del Monte","389":"Santa Inés Yatzeche","390":"Santa Lucía del Camino","391":"Santa Lucía Miahuatlán","392":"Santa Lucía Monteverde","393":"Santa Lucía Ocotlán","394":"Santa María Alotepec","395":"Santa María Apazco","396":"Santa María la Asunción","397":"Heroica Ciudad de Tlaxiaco","398":"Ayoquezco de Aldama","399":"Santa María Atzompa","400":"Santa María Camotlán","401":"Santa María Colotepec","402":"Santa María Cortijo","403":"Santa María Coyotepec","404":"Santa María Chachoápam","405":"Villa de Chilapa de Díaz","406":"Santa María Chilchotla","407":"Santa María Chimalapa","408":"Santa María del Rosario","409":"Santa María del Tule","410":"Santa María Ecatepec","411":"Santa María Guelacé","412":"Santa María Guienagati","413":"Santa María Huatulco","414":"Santa María Huazolotitlán","415":"Santa María Ipalapa","416":"Santa María Ixcatlán","417":"Santa María Jacatepec","418":"Santa María Jalapa del Marqués","419":"Santa María Jaltianguis","420":"Santa María Lachixío","421":"Santa María Mixtequilla","422":"Santa María Nativitas","423":"Santa María Nduayaco","424":"Santa María Ozolotepec","425":"Santa María Pápalo","426":"Santa María Peñoles","427":"Santa María Petapa","428":"Santa María Quiegolani","429":"Santa María Sola","430":"Santa María Tataltepec","431":"Santa María Tecomavaca","432":"Santa María Temaxcalapa","433":"Santa María Temaxcaltepec","434":"Santa María Teopoxco","435":"Santa María Tepantlali","436":"Santa María Texcatitlán","437":"Santa María Tlahuitoltepec","438":"Santa María Tlalixtac","439":"Santa María Tonameca","440":"Santa María Totolapilla","441":"Santa María Xadani","442":"Santa María Yalina","443":"Santa María Yavesía","444":"Santa María Yolotepec","445":"Santa María Yosoyúa","446":"Santa María Yucuhiti","447":"Santa María Zacatepec","448":"Santa María Zaniza","449":"Santa María Zoquitlán","450":"Santiago Amoltepec","451":"Santiago Apoala","452":"Santiago Apóstol","453":"Santiago Astata","454":"Santiago Atitlán","455":"Santiago Ayuquililla","456":"Santiago Cacaloxtepec","457":"Santiago Camotlán","458":"Santiago Comaltepec","459":"Villa de Santiago Chazumba","460":"Santiago Choápam","461":"Santiago del Río","462":"Santiago Huajolotitlán","463":"Santiago Huauclilla","464":"Santiago Ihuitlán Plumas","465":"Santiago Ixcuintepec","466":"Santiago Ixtayutla","467":"Santiago Jamiltepec","468":"Santiago Jocotepec","469":"Santiago Juxtlahuaca","470":"Santiago Lachiguiri","471":"Santiago Lalopa","472":"Santiago Laollaga","473":"Santiago Laxopa","474":"Santiago Llano Grande","475":"Santiago Matatlán","476":"Santiago Miltepec","477":"Santiago Minas","478":"Santiago Nacaltepec","479":"Santiago Nejapilla","480":"Santiago Nundiche","481":"Santiago Nuyoó","482":"Santiago Pinotepa Nacional","483":"Santiago Suchilquitongo","484":"Santiago Tamazola","485":"Santiago Tapextla","486":"Villa Tejúpam de la Unión","487":"Santiago Tenango","488":"Santiago Tepetlapa","489":"Santiago Tetepec","490":"Santiago Texcalcingo","491":"Santiago Textitlán","492":"Santiago Tilantongo","493":"Santiago Tillo","494":"Santiago Tlazoyaltepec","495":"Santiago Xanica","496":"Santiago Xiacuí","497":"Santiago Yaitepec","498":"Santiago Yaveo","499":"Santiago Yolomécatl","500":"Santiago Yosondúa","501":"Santiago Yucuyachi","502":"Santiago Zacatepec","503":"Santiago Zoochila","504":"Nuevo Zoquiápam","505":"Santo Domingo Ingenio","506":"Santo Domingo Albarradas","507":"Santo Domingo Armenta","508":"Santo Domingo Chihuitán","509":"Santo Domingo de Morelos","510":"Santo Domingo Ixcatlán","511":"Santo Domingo Nuxaá","512":"Santo Domingo Ozolotepec","513":"Santo Domingo Petapa","514":"Santo Domingo Roayaga","515":"Santo Domingo Tehuantepec","516":"Santo Domingo Teojomulco","517":"Santo Domingo Tepuxtepec","518":"Santo Domingo Tlatayápam","519":"Santo Domingo Tomaltepec","520":"Santo Domingo Tonalá","521":"Santo Domingo Tonaltepec","522":"Santo Domingo Xagacía","523":"Santo Domingo Yanhuitlán","524":"Santo Domingo Yodohino","525":"Santo Domingo Zanatepec","526":"Santos Reyes Nopala","527":"Santos Reyes Pápalo","528":"Santos Reyes Tepejillo","529":"Santos Reyes Yucuná","530":"Santo Tomás Jalieza","531":"Santo Tomás Mazaltepec","532":"Santo Tomás Ocotepec","533":"Santo Tomás Tamazulapan","534":"San Vicente Coatlán","535":"San Vicente Lachixío","536":"San Vicente Nuñú","537":"Silacayoápam","538":"Sitio de Xitlapehua","539":"Soledad Etla","540":"Villa de Tamazulápam del Progreso","541":"Tanetze de Zaragoza","542":"Taniche","543":"Tataltepec de Valdés","544":"Teococuilco de Marcos Pérez","545":"Teotitlán de Flores Magón","546":"Teotitlán del Valle","547":"Teotongo","548":"Tepelmeme Villa de Morelos","549":"Tezoatlán de Segura y Luna","550":"San Jerónimo Tlacochahuaya","551":"Tlacolula de Matamoros","552":"Tlacotepec Plumas","553":"Tlalixtac de Cabrera","554":"Totontepec Villa de Morelos","555":"Trinidad Zaachila","556":"La Trinidad Vista Hermosa","557":"Unión Hidalgo","558":"Valerio Trujano","559":"San Juan Bautista Valle Nacional","560":"Villa Díaz Ordaz","561":"Yaxe","562":"Magdalena Yodocono de Porfirio Díaz","563":"Yogana","564":"Yutanduchi de Guerrero","565":"Villa de Zaachila","566":"San Mateo Yucutindoo","567":"Zapotitlán Lagunas","568":"Zapotitlán Palmas","569":"Santa Inés de Zaragoza","570":"Zimatlán de Álvarez"},
+  21: {"001":"Acajete","002":"Acateno","003":"Acatlán","004":"Acatzingo","005":"Acteopan","006":"Ahuacatlán","007":"Ahuatlán","008":"Ahuazotepec","009":"Ahuehuetitla","010":"Ajalpan","011":"Albino Zertuche","012":"Aljojuca","013":"Altepexi","014":"Amixtlán","015":"Amozoc","016":"Aquixtla","017":"Atempan","018":"Atexcal","019":"Atlixco","020":"Atoyatempan","021":"Atzala","022":"Atzitzihuacán","023":"Atzitzintla","024":"Axutla","025":"Ayotoxco de Guerrero","026":"Calpan","027":"Caltepec","028":"Camocuautla","029":"Caxhuacan","030":"Coatepec","031":"Coatzingo","032":"Cohetzala","033":"Cohuecan","034":"Coronango","035":"Coxcatlán","036":"Coyomeapan","037":"Coyotepec","038":"Cuapiaxtla de Madero","039":"Cuautempan","040":"Cuautinchán","041":"Cuautlancingo","042":"Cuayuca de Andrade","043":"Cuetzalan del Progreso","044":"Cuyoaco","045":"Chalchicomula de Sesma","046":"Chapulco","047":"Chiautla","048":"Chiautzingo","049":"Chiconcuautla","050":"Chichiquila","051":"Chietla","052":"Chigmecatitlán","053":"Chignahuapan","054":"Chignautla","055":"Chila","056":"Chila de la Sal","057":"Honey","058":"Chilchotla","059":"Chinantla","060":"Domingo Arenas","061":"Eloxochitlán","062":"Epatlán","063":"Esperanza","064":"Francisco Z. Mena","065":"General Felipe Ángeles","066":"Guadalupe","067":"Guadalupe Victoria","068":"Hermenegildo Galeana","069":"Huaquechula","070":"Huatlatlauca","071":"Huauchinango","072":"Huehuetla","073":"Huehuetlán el Chico","074":"Huejotzingo","075":"Hueyapan","076":"Hueytamalco","077":"Hueytlalpan","078":"Huitzilan de Serdán","079":"Huitziltepec","080":"Atlequizayan","081":"Ixcamilpa de Guerrero","082":"Ixcaquixtla","083":"Ixtacamaxtitlán","084":"Ixtepec","085":"Izúcar de Matamoros","086":"Jalpan","087":"Jolalpan","088":"Jonotla","089":"Jopala","090":"Juan C. Bonilla","091":"Juan Galindo","092":"Juan N. Méndez","093":"Lafragua","094":"Libres","095":"La Magdalena Tlatlauquitepec","096":"Mazapiltepec de Juárez","097":"Mixtla","098":"Molcaxac","099":"Cañada Morelos","100":"Naupan","101":"Nauzontla","102":"Nealtican","103":"Nicolás Bravo","104":"Nopalucan","105":"Ocotepec","106":"Ocoyucan","107":"Olintla","108":"Oriental","109":"Pahuatlán","110":"Palmar de Bravo","111":"Pantepec","112":"Petlalcingo","113":"Piaxtla","114":"Puebla","115":"Quecholac","116":"Quimixtlán","117":"Rafael Lara Grajales","118":"Los Reyes de Juárez","119":"San Andrés Cholula","120":"San Antonio Cañada","121":"San Diego la Mesa Tochimiltzingo","122":"San Felipe Teotlalcingo","123":"San Felipe Tepatlán","124":"San Gabriel Chilac","125":"San Gregorio Atzompa","126":"San Jerónimo Tecuanipan","127":"San Jerónimo Xayacatlán","128":"San José Chiapa","129":"San José Miahuatlán","130":"San Juan Atenco","131":"San Juan Atzompa","132":"San Martín Texmelucan","133":"San Martín Totoltepec","134":"San Matías Tlalancaleca","135":"San Miguel Ixitlán","136":"San Miguel Xoxtla","137":"San Nicolás Buenos Aires","138":"San Nicolás de los Ranchos","139":"San Pablo Anicano","140":"San Pedro Cholula","141":"San Pedro Yeloixtlahuaca","142":"San Salvador el Seco","143":"San Salvador el Verde","144":"San Salvador Huixcolotla","145":"San Sebastián Tlacotepec","146":"Santa Catarina Tlaltempan","147":"Santa Inés Ahuatempan","148":"Santa Isabel Cholula","149":"Santiago Miahuatlán","150":"Huehuetlán el Grande","151":"Santo Tomás Hueyotlipan","152":"Soltepec","153":"Tecali de Herrera","154":"Tecamachalco","155":"Tecomatlán","156":"Tehuacán","157":"Tehuitzingo","158":"Tenampulco","159":"Teopantlán","160":"Teotlalco","161":"Tepanco de López","162":"Tepango de Rodríguez","163":"Tepatlaxco de Hidalgo","164":"Tepeaca","165":"Tepemaxalco","166":"Tepeojuma","167":"Tepetzintla","168":"Tepexco","169":"Tepexi de Rodríguez","170":"Tepeyahualco","171":"Tepeyahualco de Cuauhtémoc","172":"Tetela de Ocampo","173":"Teteles de Ávila Castillo","174":"Teziutlán","175":"Tianguismanalco","176":"Tilapa","177":"Tlacotepec de Benito Juárez","178":"Tlacuilotepec","179":"Tlachichuca","180":"Tlahuapan","181":"Tlaltenango","182":"Tlanepantla","183":"Tlaola","184":"Tlapacoya","185":"Tlapanalá","186":"Tlatlauquitepec","187":"Tlaxco","188":"Tochimilco","189":"Tochtepec","190":"Totoltepec de Guerrero","191":"Tulcingo","192":"Tuzamapan de Galeana","193":"Tzicatlacoyan","194":"Venustiano Carranza","195":"Vicente Guerrero","196":"Xayacatlán de Bravo","197":"Xicotepec","198":"Xicotlán","199":"Xiutetelco","200":"Xochiapulco","201":"Xochiltepec","202":"Xochitlán de Vicente Suárez","203":"Xochitlán Todos Santos","204":"Yaonáhuac","205":"Yehualtepec","206":"Zacapala","207":"Zacapoaxtla","208":"Zacatlán","209":"Zapotitlán","210":"Zapotitlán de Méndez","211":"Zaragoza","212":"Zautla","213":"Zihuateutla","214":"Zinacatepec","215":"Zongozotla","216":"Zoquiapan","217":"Zoquitlán"},
+  22: {"001":"Amealco de Bonfil","002":"Pinal de Amoles","003":"Arroyo Seco","004":"Cadereyta de Montes","005":"Colón","006":"Corregidora","007":"Ezequiel Montes","008":"Huimilpan","009":"Jalpan de Serra","010":"Landa de Matamoros","011":"El Marqués","012":"Pedro Escobedo","013":"Peñamiller","014":"Querétaro","015":"San Joaquín","016":"San Juan del Río","017":"Tequisquiapan","018":"Tolimán"},
+  23: {"001":"Cozumel","002":"Felipe Carrillo Puerto","003":"Isla Mujeres","004":"Othón P. Blanco","005":"Benito Juárez","006":"José María Morelos","007":"Lázaro Cárdenas","008":"Playa del Carmen","009":"Tulum","010":"Bacalar","011":"Puerto Morelos"},
+  24: {"001":"Ahualulco del Sonido 13","002":"Alaquines","003":"Aquismón","004":"Armadillo de los Infante","005":"Cárdenas","006":"Catorce","007":"Cedral","008":"Cerritos","009":"Cerro de San Pedro","010":"Ciudad del Maíz","011":"Ciudad Fernández","012":"Tancanhuitz","013":"Ciudad Valles","014":"Coxcatlán","015":"Charcas","016":"Ebano","017":"Guadalcázar","018":"Huehuetlán","019":"Lagunillas","020":"Matehuala","021":"Mexquitic de Carmona","022":"Moctezuma","023":"Rayón","024":"Rioverde","025":"Salinas","026":"San Antonio","027":"San Ciro de Acosta","028":"San Luis Potosí","029":"San Martín Chalchicuautla","030":"San Nicolás Tolentino","031":"Santa Catarina","032":"Santa María del Río","033":"Santo Domingo","034":"San Vicente Tancuayalab","035":"Soledad de Graciano Sánchez","036":"Tamasopo","037":"Tamazunchale","038":"Tampacán","039":"Tampamolón Corona","040":"Tamuín","041":"Tanlajás","042":"Tanquián de Escobedo","043":"Tierra Nueva","044":"Vanegas","045":"Venado","046":"Villa de Arriaga","047":"Villa de Guadalupe","048":"Villa de la Paz","049":"Villa de Ramos","050":"Villa de Reyes","051":"Villa Hidalgo","052":"Villa Juárez","053":"Axtla de Terrazas","054":"Xilitla","055":"Zaragoza","056":"Villa de Arista","057":"Matlapa","058":"El Naranjo","059":"Villa de Pozos"},
+  25: {"001":"Ahome","002":"Angostura","003":"Badiraguato","004":"Concordia","005":"Cosalá","006":"Culiacán","007":"Choix","008":"Elota","009":"Escuinapa","010":"El Fuerte","011":"Guasave","012":"Mazatlán","013":"Mocorito","014":"Rosario","015":"Salvador Alvarado","016":"San Ignacio","017":"Sinaloa","018":"Navolato","019":"Eldorado","020":"Juan José Ríos"},
+  26: {"001":"Aconchi","002":"Agua Prieta","003":"Álamos","004":"Altar","005":"Arivechi","006":"Arizpe","007":"Atil","008":"Bacadéhuachi","009":"Bacanora","010":"Bacerac","011":"Bacoachi","012":"Bácum","013":"Banámichi","014":"Baviácora","015":"Bavispe","016":"Benjamín Hill","017":"Caborca","018":"Cajeme","019":"Cananea","020":"Carbó","021":"La Colorada","022":"Cucurpe","023":"Cumpas","024":"Divisaderos","025":"Empalme","026":"Etchojoa","027":"Fronteras","028":"Granados","029":"Guaymas","030":"Hermosillo","031":"Huachinera","032":"Huásabas","033":"Huatabampo","034":"Huépac","035":"Imuris","036":"Magdalena","037":"Mazatán","038":"Moctezuma","039":"Naco","040":"Nácori Chico","041":"Nacozari de García","042":"Navojoa","043":"Nogales","044":"Ónavas","045":"Opodepe","046":"Oquitoa","047":"Pitiquito","048":"Puerto Peñasco","049":"Quiriego","050":"Rayón","051":"Rosario","052":"Sahuaripa","053":"San Felipe de Jesús","054":"San Javier","055":"San Luis Río Colorado","056":"San Miguel de Horcasitas","057":"San Pedro de la Cueva","058":"Santa Ana","059":"Santa Cruz","060":"Sáric","061":"Soyopa","062":"Suaqui Grande","063":"Tepache","064":"Trincheras","065":"Tubutama","066":"Ures","067":"Villa Hidalgo","068":"Villa Pesqueira","069":"Yécora","070":"General Plutarco Elías Calles","071":"Benito Juárez","072":"San Ignacio Río Muerto"},
+  27: {"001":"Balancán","002":"Cárdenas","003":"Centla","004":"Centro","005":"Comalcalco","006":"Cunduacán","007":"Emiliano Zapata","008":"Huimanguillo","009":"Jalapa","010":"Jalpa de Méndez","011":"Jonuta","012":"Macuspana","013":"Nacajuca","014":"Paraíso","015":"Tacotalpa","016":"Teapa","017":"Tenosique"},
+  28: {"001":"Abasolo","002":"Aldama","003":"Altamira","004":"Antiguo Morelos","005":"Burgos","006":"Bustamante","007":"Camargo","008":"Casas","009":"Ciudad Madero","010":"Cruillas","011":"Gómez Farías","012":"González","013":"Güémez","014":"Guerrero","015":"Gustavo Díaz Ordaz","016":"Hidalgo","017":"Jaumave","018":"Jiménez","019":"Llera","020":"Mainero","021":"El Mante","022":"Matamoros","023":"Méndez","024":"Mier","025":"Miguel Alemán","026":"Miquihuana","027":"Nuevo Laredo","028":"Nuevo Morelos","029":"Ocampo","030":"Padilla","031":"Palmillas","032":"Reynosa","033":"Río Bravo","034":"San Carlos","035":"San Fernando","036":"San Nicolás","037":"Soto la Marina","038":"Tampico","039":"Tula","040":"Valle Hermoso","041":"Victoria","042":"Villagrán","043":"Xicoténcatl"},
+  29: {"001":"Amaxac de Guerrero","002":"Apetatitlán de Antonio Carvajal","003":"Atlangatepec","004":"Atltzayanca","005":"Apizaco","006":"Calpulalpan","007":"El Carmen Tequexquitla","008":"Cuapiaxtla","009":"Cuaxomulco","010":"Chiautempan","011":"Muñoz de Domingo Arenas","012":"Españita","013":"Huamantla","014":"Hueyotlipan","015":"Ixtacuixtla de Mariano Matamoros","016":"Ixtenco","017":"Mazatecochco de José María Morelos","018":"Contla de Juan Cuamatzi","019":"Tepetitla de Lardizábal","020":"Sanctórum de Lázaro Cárdenas","021":"Nanacamilpa de Mariano Arista","022":"Acuamanala de Miguel Hidalgo","023":"Natívitas","024":"Panotla","025":"San Pablo del Monte","026":"Santa Cruz Tlaxcala","027":"Tenancingo","028":"Teolocholco","029":"Tepeyanco","030":"Terrenate","031":"Tetla de la Solidaridad","032":"Tetlatlahuca","033":"Tlaxcala","034":"Tlaxco","035":"Tocatlán","036":"Totolac","037":"Ziltlaltépec de Trinidad Sánchez Santos","038":"Tzompantepec","039":"Xaloztoc","040":"Xaltocan","041":"Papalotla de Xicohténcatl","042":"Xicohtzinco","043":"Yauhquemehcan","044":"Zacatelco","045":"Benito Juárez","046":"Emiliano Zapata","047":"Lázaro Cárdenas","048":"La Magdalena Tlaltelulco","049":"San Damián Texóloc","050":"San Francisco Tetlanohcan","051":"San Jerónimo Zacualpan","052":"San José Teacalco","053":"San Juan Huactzinco","054":"San Lorenzo Axocomanitla","055":"San Lucas Tecopilco","056":"Santa Ana Nopalucan","057":"Santa Apolonia Teacalco","058":"Santa Catarina Ayometla","059":"Santa Cruz Quilehtla","060":"Santa Isabel Xiloxoxtla"},
+  30: {"001":"Acajete","002":"Acatlán","003":"Acayucan","004":"Actopan","005":"Acula","006":"Acultzingo","007":"Camarón de Tejeda","008":"Alpatláhuac","009":"Alto Lucero de Gutiérrez Barrios","010":"Altotonga","011":"Alvarado","012":"Amatitlán","013":"Naranjos Amatlán","014":"Amatlán de los Reyes","015":"Angel R. Cabada","016":"La Antigua","017":"Apazapan","018":"Aquila","019":"Astacinga","020":"Atlahuilco","021":"Atoyac","022":"Atzacan","023":"Atzalan","024":"Tlaltetela","025":"Ayahualulco","026":"Banderilla","027":"Benito Juárez","028":"Boca del Río","029":"Calcahualco","030":"Camerino Z. Mendoza","031":"Carrillo Puerto","032":"Catemaco","033":"Cazones de Herrera","034":"Cerro Azul","035":"Citlaltépetl","036":"Coacoatzintla","037":"Coahuitlán","038":"Coatepec","039":"Coatzacoalcos","040":"Coatzintla","041":"Coetzala","042":"Colipa","043":"Comapa","044":"Córdoba","045":"Cosamaloapan de Carpio","046":"Cosautlán de Carvajal","047":"Coscomatepec","048":"Cosoleacaque","049":"Cotaxtla","050":"Coxquihui","051":"Coyutla","052":"Cuichapa","053":"Cuitláhuac","054":"Chacaltianguis","055":"Chalma","056":"Chiconamel","057":"Chiconquiaco","058":"Chicontepec","059":"Chinameca","060":"Chinampa de Gorostiza","061":"Las Choapas","062":"Chocamán","063":"Chontla","064":"Chumatlán","065":"Emiliano Zapata","066":"Espinal","067":"Filomeno Mata","068":"Fortín","069":"Gutiérrez Zamora","070":"Hidalgotitlán","071":"Huatusco","072":"Huayacocotla","073":"Hueyapan de Ocampo","074":"Huiloapan de Cuauhtémoc","075":"Ignacio de la Llave","076":"Ilamatlán","077":"Isla","078":"Ixcatepec","079":"Ixhuacán de los Reyes","080":"Ixhuatlán del Café","081":"Ixhuatlancillo","082":"Ixhuatlán del Sureste","083":"Ixhuatlán de Madero","084":"Ixmatlahuacan","085":"Ixtaczoquitlán","086":"Jalacingo","087":"Xalapa","088":"Jalcomulco","089":"Jáltipan","090":"Jamapa","091":"Jesús Carranza","092":"Xico","093":"Jilotepec","094":"Juan Rodríguez Clara","095":"Juchique de Ferrer","096":"Landero y Coss","097":"Lerdo de Tejada","098":"Magdalena","099":"Maltrata","100":"Manlio Fabio Altamirano","101":"Mariano Escobedo","102":"Martínez de la Torre","103":"Mecatlán","104":"Mecayapan","105":"Medellín de Bravo","106":"Miahuatlán","107":"Las Minas","108":"Minatitlán","109":"Misantla","110":"Mixtla de Altamirano","111":"Moloacán","112":"Naolinco","113":"Naranjal","114":"Nautla","115":"Nogales","116":"Oluta","117":"Omealca","118":"Orizaba","119":"Otatitlán","120":"Oteapan","121":"Ozuluama de Mascareñas","122":"Pajapan","123":"Pánuco","124":"Papantla","125":"Paso del Macho","126":"Paso de Ovejas","127":"La Perla","128":"Perote","129":"Platón Sánchez","130":"Playa Vicente","131":"Poza Rica de Hidalgo","132":"Las Vigas de Ramírez","133":"Pueblo Viejo","134":"Puente Nacional","135":"Rafael Delgado","136":"Rafael Lucio","137":"Los Reyes","138":"Río Blanco","139":"Saltabarranca","140":"San Andrés Tenejapan","141":"San Andrés Tuxtla","142":"San Juan Evangelista","143":"Santiago Tuxtla","144":"Sayula de Alemán","145":"Soconusco","146":"Sochiapa","147":"Soledad Atzompa","148":"Soledad de Doblado","149":"Soteapan","150":"Tamalín","151":"Tamiahua","152":"Tampico Alto","153":"Tancoco","154":"Tantima","155":"Tantoyuca","156":"Tatatila","157":"Castillo de Teayo","158":"Tecolutla","159":"Tehuipango","160":"Álamo Temapache","161":"Tempoal","162":"Tenampa","163":"Tenochtitlán","164":"Teocelo","165":"Tepatlaxco","166":"Tepetlán","167":"Tepetzintla","168":"Tequila","169":"José Azueta","170":"Texcatepec","171":"Texhuacán","172":"Texistepec","173":"Tezonapa","174":"Tierra Blanca","175":"Tihuatlán","176":"Tlacojalpan","177":"Tlacolulan","178":"Tlacotalpan","179":"Tlacotepec de Mejía","180":"Tlachichilco","181":"Tlalixcoyan","182":"Tlalnelhuayocan","183":"Tlapacoyan","184":"Tlaquilpa","185":"Tlilapan","186":"Tomatlán","187":"Tonayán","188":"Totutla","189":"Tuxpan","190":"Tuxtilla","191":"Ursulo Galván","192":"Vega de Alatorre","193":"Veracruz","194":"Villa Aldama","195":"Xoxocotla","196":"Yanga","197":"Yecuatla","198":"Zacualpan","199":"Zaragoza","200":"Zentla","201":"Zongolica","202":"Zontecomatlán de López y Fuentes","203":"Zozocolco de Hidalgo","204":"Agua Dulce","205":"El Higo","206":"Nanchital de Lázaro Cárdenas del Río","207":"Tres Valles","208":"Carlos A. Carrillo","209":"Tatahuicapan de Juárez","210":"Uxpanapa","211":"San Rafael","212":"Santiago Sochiapan"},
+  31: {"001":"Abalá","002":"Acanceh","003":"Akil","004":"Baca","005":"Bokobá","006":"Buctzotz","007":"Cacalchén","008":"Calotmul","009":"Cansahcab","010":"Cantamayec","011":"Celestún","012":"Cenotillo","013":"Conkal","014":"Cuncunul","015":"Cuzamá","016":"Chacsinkín","017":"Chankom","018":"Chapab","019":"Chemax","020":"Chicxulub Pueblo","021":"Chichimilá","022":"Chikindzonot","023":"Chocholá","024":"Chumayel","025":"Dzan","026":"Dzemul","027":"Dzidzantún","028":"Dzilam de Bravo","029":"Dzilam González","030":"Dzitás","031":"Dzoncauich","032":"Espita","033":"Halachó","034":"Hocabá","035":"Hoctún","036":"Homún","037":"Huhí","038":"Hunucmá","039":"Ixil","040":"Izamal","041":"Kanasín","042":"Kantunil","043":"Kaua","044":"Kinchil","045":"Kopomá","046":"Mama","047":"Maní","048":"Maxcanú","049":"Mayapán","050":"Mérida","051":"Mocochá","052":"Motul","053":"Muna","054":"Muxupip","055":"Opichén","056":"Oxkutzcab","057":"Panabá","058":"Peto","059":"Progreso","060":"Quintana Roo","061":"Río Lagartos","062":"Sacalum","063":"Samahil","064":"Sanahcat","065":"San Felipe","066":"Santa Elena","067":"Seyé","068":"Sinanché","069":"Sotuta","070":"Sucilá","071":"Sudzal","072":"Suma","073":"Tahdziú","074":"Tahmek","075":"Teabo","076":"Tecoh","077":"Tekal de Venegas","078":"Tekantó","079":"Tekax","080":"Tekit","081":"Tekom","082":"Telchac Pueblo","083":"Telchac Puerto","084":"Temax","085":"Temozón","086":"Tepakán","087":"Tetiz","088":"Teya","089":"Ticul","090":"Timucuy","091":"Tinum","092":"Tixcacalcupul","093":"Tixkokob","094":"Tixméhuac","095":"Tixpéual","096":"Tizimín","097":"Tunkás","098":"Tzucacab","099":"Uayma","100":"Ucú","101":"Umán","102":"Valladolid","103":"Xocchel","104":"Yaxcabá","105":"Yaxkukul","106":"Yobaín"},
+  32: {"001":"Apozol","002":"Apulco","003":"Atolinga","004":"Benito Juárez","005":"Calera","006":"Cañitas de Felipe Pescador","007":"Concepción del Oro","008":"Cuauhtémoc","009":"Chalchihuites","010":"Fresnillo","011":"Trinidad García de la Cadena","012":"Genaro Codina","013":"General Enrique Estrada","014":"General Francisco R. Murguía","015":"El Plateado de Joaquín Amaro","016":"General Pánfilo Natera","017":"Guadalupe","018":"Huanusco","019":"Jalpa","020":"Jerez","021":"Jiménez del Teul","022":"Juan Aldama","023":"Juchipila","024":"Loreto","025":"Luis Moya","026":"Mazapil","027":"Melchor Ocampo","028":"Mezquital del Oro","029":"Miguel Auza","030":"Momax","031":"Monte Escobedo","032":"Morelos","033":"Moyahua de Estrada","034":"Nochistlán de Mejía","035":"Noria de Ángeles","036":"Ojocaliente","037":"Pánuco","038":"Pinos","039":"Río Grande","040":"Sain Alto","041":"El Salvador","042":"Sombrerete","043":"Susticacán","044":"Tabasco","045":"Tepechitlán","046":"Tepetongo","047":"Teúl de González Ortega","048":"Tlaltenango de Sánchez Román","049":"Valparaíso","050":"Vetagrande","051":"Villa de Cos","052":"Villa García","053":"Villa González Ortega","054":"Villa Hidalgo","055":"Villanueva","056":"Zacatecas","057":"Trancoso","058":"Santa María de la Paz"},
+};
+
+/**
+ * Resuelve un valor de municipio a su código de 3 dígitos tal cual lo
+ * espera el API de DENUE. Acepta (en este orden): código ya en formato
+ * correcto ("039", "120"), número/string corto sin ceros a la izquierda
+ * (39 -> "039", vía padStart), o nombre de municipio (case-insensitive,
+ * sin acentos) — busca dentro de la entidad ya resuelta.
+ *
+ * @param {number} entidadCodigo Código de entidad YA resuelto (resolverEntidad_).
+ * @param {string|number} municipioInput Valor crudo del criterio de búsqueda.
+ * @returns {string|number} Código de municipio listo para el API, o 0 (todos)
+ *          si no se especificó nada.
+ */
+function resolverMunicipio_(entidadCodigo, municipioInput) {
+  if (municipioInput == null || municipioInput === '') return 0;
+
+  const municipiosEntidad = MUNICIPIOS[entidadCodigo];
+  const valorTexto = String(municipioInput).trim();
+
+  // Ya es un código numérico (con o sin ceros a la izquierda).
+  if (/^\d+$/.test(valorTexto)) {
+    const codigoPadded = valorTexto.padStart(3, '0');
+    return codigoPadded; // Si la entidad no tiene catálogo o el código no matchea, se manda igual — mismo comportamiento que antes de este cambio.
+  }
+
+  // Es un nombre — buscar dentro de la entidad.
+  if (municipiosEntidad) {
+    const buscado = normalizarTexto_(valorTexto);
+    const encontrado = Object.keys(municipiosEntidad).find(function (codigo) {
+      return normalizarTexto_(municipiosEntidad[codigo]) === buscado;
+    });
+    if (encontrado) return encontrado;
+  }
+
+  throw new Error('Municipio no reconocido: "' + municipioInput + '" para la entidad ' + entidadCodigo + '.');
+}
+
+/**
+ * Devuelve la lista de municipios de una entidad, ordenada alfabéticamente
+ * — usada por el dropdown en cascada de Pantalla 1/4 (google.script.run).
+ * @param {string|number} entidad Nombre o código de entidad.
+ * @returns {Array<{codigo:string, nombre:string}>}
+ */
+function obtenerMunicipiosDeEntidad(entidad) {
+  const codigo = resolverEntidad_(entidad);
+  const municipiosEntidad = MUNICIPIOS[codigo] || {};
+  return Object.keys(municipiosEntidad)
+    .map(function (c) { return { codigo: c, nombre: municipiosEntidad[c] }; })
+    .sort(function (a, b) { return a.nombre.localeCompare(b.nombre, 'es'); });
+}
+
+/**
+ * Devuelve la lista completa de entidades para poblar el dropdown de
+ * Pantalla 1/4 — ordenada alfabéticamente (google.script.run).
+ * @returns {Array<{codigo:number, nombre:string}>}
+ */
+function obtenerListaEntidades() {
+  return ENTIDADES_LISTA.slice().sort(function (a, b) { return a.nombre.localeCompare(b.nombre, 'es'); });
+}
+
+// ---------------------------------------------------------------------------
+// Función principal — combina todos los criterios de búsqueda
+// ---------------------------------------------------------------------------
+
+/**
+ * Busca establecimientos en DENUE combinando cualquier criterio disponible.
+ *
+ * @param {Object} opciones
+ * @param {string} [opciones.giro]      Texto libre de giro/actividad (ej. "panaderia").
+ *                                       Si se omite, busca "todas las actividades".
+ * @param {string} [opciones.entidad]   Nombre de entidad (ej. "Jalisco") o código INEGI.
+ *                                       Requerido si se usa estrato o búsqueda pura por tamaño.
+ * @param {string|number} [opciones.municipio] Código de municipio INEGI (con o sin ceros a la
+ *                                       izquierda), o nombre de municipio (ej. "Zapopan") — se
+ *                                       resuelve vía resolverMunicipio_() (17 ago 2026, catálogo
+ *                                       completo de 2,478 municipios). 0 = todos los municipios.
+ * @param {number|Array<number>} [opciones.estrato] 0-7 (ver ESTRATOS), o un
+ *                                       arreglo de varios (ej. [3, 4] para
+ *                                       "11 a 50 empleados") — el API no
+ *                                       soporta rangos nativos, así que se
+ *                                       hace una llamada por estrato y se
+ *                                       juntan/deduplican los resultados.
+ *                                       Default 0 (todos).
+ * @param {string} [opciones.cp]        Código postal — se aplica como FILTRO POST-BÚSQUEDA,
+ *                                       no como parámetro del API (ver hallazgo #3 arriba).
+ * @param {string} [opciones.colonia]   Nombre de colonia — mismo filtro post-búsqueda.
+ * @param {number} [opciones.maxResultados] Tope de resultados a traer (default 1000).
+ * @returns {Array<Object>} Lista de establecimientos (registros DENUE crudos).
+ */
+function buscarDenue(opciones) {
+  opciones = opciones || {};
+  const entidadCodigo = resolverEntidad_(opciones.entidad);
+
+  if (!entidadCodigo) {
+    throw new Error('Se requiere "entidad" para buscar en DENUE (ej. "Jalisco" o código 14).');
+  }
+
+  const municipio = resolverMunicipio_(entidadCodigo, opciones.municipio);
+  const maxResultados = opciones.maxResultados || 1000;
+
+  // Término de búsqueda: giro libre, o "0" (comodín = todas las actividades)
+  // si no se especificó giro — confirmado empíricamente (hallazgo #2).
+  const nombreBusqueda = (opciones.giro && opciones.giro.trim()) ? opciones.giro.trim() : '0';
+
+  // Estrato puede ser un solo valor o un arreglo (rango combinado — hallazgo
+  // #5). Se normaliza siempre a arreglo para reusar la misma lógica.
+  const estratoInput = opciones.estrato != null ? opciones.estrato : 0;
+  const estratos = Array.isArray(estratoInput) ? estratoInput : [estratoInput];
+
+  let resultados = [];
+  estratos.forEach(function (estrato) {
+    const bloque = paginarBuscarAreaActEstr_({
+      entidad: entidadCodigo,
+      municipio: municipio,
+      nombreBusqueda: nombreBusqueda,
+      estrato: estrato,
+      maxResultados: maxResultados,
+    });
+    resultados = resultados.concat(bloque);
+  });
+
+  // Si se combinaron varios estratos, deduplicar por Id (un mismo
+  // establecimiento no debería repetirse entre bandas, pero por seguridad).
+  if (estratos.length > 1) {
+    resultados = deduplicarPorId_(resultados);
+  }
+
+  // Filtros post-búsqueda (CP y colonia no son parámetros del API — hallazgo #3).
+  if (opciones.cp) {
+    resultados = filtrarPorCP(resultados, opciones.cp);
+  }
+  if (opciones.colonia) {
+    resultados = filtrarPorColonia(resultados, opciones.colonia);
+  }
+
+  return resultados.slice(0, maxResultados);
+}
+
+/** Quita registros con Id duplicado, conservando el primero. */
+function deduplicarPorId_(registros) {
+  const vistos = {};
+  return registros.filter(function (r) {
+    if (vistos[r.Id]) return false;
+    vistos[r.Id] = true;
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Paginación del método BuscarAreaActEstr
+// ---------------------------------------------------------------------------
+
+/**
+ * Pagina automáticamente sobre BuscarAreaActEstr en bloques de
+ * DENUE_TAMANO_BLOQUE hasta juntar maxResultados o agotar resultados.
+ */
+// Reintentos ante fallas de red puntuales (HTTP 0 / timeout) — hallazgo
+// del 13 ago 2026: la API de DENUE responde bien y rápido cuando se prueba
+// directo (confirmado con curl), pero desde Apps Script ocurrió un "HTTP 0"
+// (fallo de red, no de DENUE) dos veces seguidas en una búsqueda real.
+// Mismo patrón de resiliencia que ya tiene el servicio IMPI.
+const DENUE_MAX_REINTENTOS = 3;
+const DENUE_DELAY_REINTENTO_MS = 3000;
+
+function fetchDenueConReintentos_(url) {
+  let ultimoError = null;
+  for (let intento = 1; intento <= DENUE_MAX_REINTENTOS; intento++) {
+    try {
+      const respuesta = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      const codigo = respuesta.getResponseCode();
+      if (codigo === 200) return respuesta;
+      ultimoError = new Error('Error DENUE HTTP ' + codigo + ': ' + respuesta.getContentText());
+    } catch (e) {
+      ultimoError = e; // Fallo de red real (ni siquiera regresó un código HTTP).
+    }
+    Logger.log('DENUE intento %s/%s falló: %s', intento, DENUE_MAX_REINTENTOS, ultimoError.message);
+    if (intento < DENUE_MAX_REINTENTOS) Utilities.sleep(DENUE_DELAY_REINTENTO_MS);
+  }
+  throw ultimoError;
+}
+
+function paginarBuscarAreaActEstr_(params) {
+  const resultados = [];
+  let inicio = 1;
+
+  while (resultados.length < params.maxResultados) {
+    // Pide solo lo que falta (tope DENUE_TAMANO_BLOQUE) en vez de siempre
+    // pedir un bloque completo de 500 aunque solo hagan falta 15-20.
+    const faltan = params.maxResultados - resultados.length;
+    const tamanoPagina = Math.min(DENUE_TAMANO_BLOQUE, faltan);
+    const fin = inicio + tamanoPagina - 1;
+    const url = [
+      DENUE_BASE_URL,
+      'BuscarAreaActEstr',
+      params.entidad,
+      params.municipio,
+      0, 0, 0, // Localidad, AGEB, Manzana
+      0, 0, 0, 0, // Sector, Subsector, Rama, Clase (0 = todas las actividades)
+      encodeURIComponent(params.nombreBusqueda),
+      inicio,
+      fin,
+      0, // Id
+      params.estrato,
+      DENUE_TOKEN,
+    ].join('/');
+
+    const respuesta = fetchDenueConReintentos_(url);
+
+    const texto = respuesta.getContentText();
+    let bloque;
+    try {
+      bloque = JSON.parse(texto);
+    } catch (e) {
+      throw new Error('Respuesta DENUE no es JSON válido: ' + texto.substring(0, 200));
+    }
+
+    if (!Array.isArray(bloque) || bloque.length === 0) {
+      break; // No hay más resultados.
+    }
+
+    resultados.push.apply(resultados, bloque);
+
+    if (bloque.length < tamanoPagina) {
+      break; // Último bloque parcial: ya no hay más.
+    }
+    inicio = fin + 1;
+  }
+
+  return resultados.slice(0, params.maxResultados);
+}
+
+// ---------------------------------------------------------------------------
+// Filtros post-búsqueda (CP y colonia)
+// ---------------------------------------------------------------------------
+
+/** Filtra un arreglo de registros DENUE por código postal exacto. */
+function filtrarPorCP(registros, cp) {
+  const cpNormalizado = String(cp).trim();
+  return registros.filter(function (r) {
+    return String(r.CP || '').trim() === cpNormalizado;
+  });
+}
+
+/** Filtra un arreglo de registros DENUE por nombre de colonia (comparación
+ *  insensible a mayúsculas/acentos, coincidencia parcial). */
+function filtrarPorColonia(registros, colonia) {
+  const coloniaNormalizada = normalizarTexto_(colonia);
+  return registros.filter(function (r) {
+    return normalizarTexto_(r.Colonia || '').indexOf(coloniaNormalizada) !== -1;
+  });
+}
+
+// normalizarTexto_() vive en utils.gs (compartida entre módulos — no
+// redefinir aquí, Apps Script combina todos los archivos en un namespace
+// global y una segunda definición pisaría la de utils.gs silenciosamente).
+
+// ---------------------------------------------------------------------------
+// Utilidades
+// ---------------------------------------------------------------------------
+
+/** Acepta nombre de entidad (case-insensitive) o código numérico directo. */
+function resolverEntidad_(entidad) {
+  if (entidad == null || entidad === '') return null;
+  if (typeof entidad === 'number') return entidad;
+  if (/^\d+$/.test(entidad)) return parseInt(entidad, 10);
+  const codigo = ENTIDADES[normalizarTexto_(entidad)];
+  if (!codigo) {
+    throw new Error('Entidad no reconocida: "' + entidad + '". Agrégala a ENTIDADES o usa el código INEGI directo.');
+  }
+  return codigo;
+}
+
+// ---------------------------------------------------------------------------
+// Catálogo de giros por Estado (30 ago 2026)
+// ---------------------------------------------------------------------------
+// Motivación: el recuadro "giros más comunes" de Pantalla ① no puede usar un
+// muestreo chico (los primeros 3,000-5,000 registros) — DENUE siempre
+// regresa el mismo bloque en el mismo orden, así que un giro genuinamente
+// raro (ej. diseño gráfico) podría no aparecer NUNCA si no cae en ese
+// primer bloque, dando la impresión falsa de que no existe. La solución es
+// un conteo COMPLETO por Estado — pero un Estado entero en 0-30 empleados
+// son potencialmente cientos de miles de registros, muy por encima del
+// límite real de 6 min/ejecución (confirmado contra la documentación
+// oficial de Apps Script). Se resuelve con el mismo patrón ya probado de la
+// campaña de lunes (orquestador.gs): cada ejecución avanza lo que alcanza
+// en ~5 min, guarda dónde se quedó en Script Properties, y agenda un
+// trigger de una sola vez para continuar — sin la espera de 15 min entre
+// intentos que sí tiene la campaña de lunes (ahí es para no golpear
+// Places/IMPI de más; aquí solo se pagina DENUE, que es gratis).
+//
+// Alcance por defecto: estratos 1-3 (0-30 empleados) — el rango real del
+// negocio (sección 1 de Claude.md), no los 7 estratos completos, para no
+// duplicar el trabajo en tamaños que de todos modos no se van a buscar.
+
+const CATGIROS_ESTRATOS_DEFECTO = [1, 2, 3];
+const CATGIROS_TIEMPO_LIMITE_MS = 5 * 60 * 1000; // margen bajo el límite real de 6 min.
+const CATGIROS_PAUSA_MS = 300; // cortesía entre llamadas — DENUE no documenta un límite, pero nunca se ha empujado este volumen.
+
+/** Dispara la actualización del catálogo para una entidad — llamado desde
+ *  Pantalla ④. Solo arma el estado inicial y agenda el primer bloque; NO
+ *  hace el trabajo pesado en esta misma llamada (el botón regresaría hasta
+ *  5 min después si lo hiciera). El trabajo real corre en segundo plano vía
+ *  trigger, ejecutarBloqueCatalogoGiros_() abajo.
+ *  @param {Array<number>} [estratos] Franjas a incluir — si se omite, usa
+ *         CATGIROS_ESTRATOS_DEFECTO (1-3, 0-30 empleados). */
+function iniciarActualizacionCatalogoGiros(entidadTexto, estratos) {
+  const entidadCodigo = resolverEntidad_(entidadTexto);
+  if (!entidadCodigo) throw new Error('Entidad no reconocida: ' + entidadTexto);
+
+  const estratosAUsar = (estratos && estratos.length) ? estratos.map(Number) : CATGIROS_ESTRATOS_DEFECTO;
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('CATGIROS_ENTIDAD')) {
+    throw new Error('Ya hay una actualización de catálogo en curso — espera a que termine, o detenla, antes de iniciar otra.');
+  }
+
+  props.deleteProperty('CATGIROS_DETENER'); // por si quedó de una corrida detenida anterior.
+  props.setProperty('CATGIROS_ENTIDAD', String(entidadCodigo));
+  props.setProperty('CATGIROS_ESTRATOS', JSON.stringify(estratosAUsar));
+  props.setProperty('CATGIROS_ESTRATO_IDX', '0');
+  props.setProperty('CATGIROS_INICIO', '1');
+  props.setProperty('CATGIROS_CONTEOS', '{}');
+
+  try {
+    ScriptApp.newTrigger('ejecutarBloqueCatalogoGiros_').timeBased().after(1000).create();
+  } catch (error) {
+    // 6 oct 2026: no dejar la bandera de "en curso" si el trigger no se pudo crear.
+    props.deleteProperty('CATGIROS_ENTIDAD');
+    throw error;
+  }
+
+  return { iniciado: true };
+}
+
+/** Botón "Detener" en Pantalla ④ — misma idea que solicitarDetenerBusqueda()
+ *  de Pantalla ① (sección 22): una bandera que el ciclo revisa en sus
+ *  puntos de chequeo, no es instantáneo, pero para dentro de la misma
+ *  llamada a DENUE en curso (unos segundos), no hasta 5 min después. */
+function solicitarDetenerCatalogoGiros() {
+  PropertiesService.getScriptProperties().setProperty('CATGIROS_DETENER', '1');
+  return { solicitado: true };
+}
+
+/** Un bloque de trabajo — se llama a sí misma encadenada vía trigger hasta
+ *  agotar los 3 estratos de la entidad en curso. Sin parámetros: todo el
+ *  estado se lee de Script Properties, porque un trigger de tiempo no puede
+ *  recibir argumentos. */
+function ejecutarBloqueCatalogoGiros_() {
+  // Higiene: borra triggers anteriores de este mismo handler (incluido el
+  // que nos disparó) para que no se acumulen hacia el tope de 20 del script.
+  eliminarTriggersDeFuncion_('ejecutarBloqueCatalogoGiros_');
+
+  const props = PropertiesService.getScriptProperties();
+  try {
+    ejecutarBloqueCatalogoGiros_intento_(props);
+  } catch (error) {
+    // Sin este catch, una falla de red (tras los 3 reintentos de
+    // fetchDenueConReintentos_) dejaría CATGIROS_ENTIDAD puesto para
+    // siempre — obtenerEstadoCatalogoGiros() reportaría "en_curso" eternamente
+    // y nadie podría volver a intentar. Se limpia y se registra el error;
+    // no hace falta correo (es una utilidad manual, no la campaña de lunes).
+    Logger.log('Catálogo de giros FALLÓ (entidad %s): %s', props.getProperty('CATGIROS_ENTIDAD'), error.stack || error.message);
+    props.deleteProperty('CATGIROS_ENTIDAD');
+    props.deleteProperty('CATGIROS_ESTRATOS');
+    props.deleteProperty('CATGIROS_ESTRATO_IDX');
+    props.deleteProperty('CATGIROS_INICIO');
+    props.deleteProperty('CATGIROS_CONTEOS');
+  }
+}
+
+function ejecutarBloqueCatalogoGiros_intento_(props) {
+  const entidadCodigo = Number(props.getProperty('CATGIROS_ENTIDAD'));
+  const estratosEnCurso = JSON.parse(props.getProperty('CATGIROS_ESTRATOS') || JSON.stringify(CATGIROS_ESTRATOS_DEFECTO));
+  let estratoIdx = Number(props.getProperty('CATGIROS_ESTRATO_IDX'));
+  let inicio = Number(props.getProperty('CATGIROS_INICIO'));
+  let conteos = JSON.parse(props.getProperty('CATGIROS_CONTEOS') || '{}');
+
+  const horaInicio = Date.now();
+
+  while (estratoIdx < estratosEnCurso.length) {
+    const estrato = estratosEnCurso[estratoIdx];
+
+    while (true) {
+      if (props.getProperty('CATGIROS_DETENER')) {
+        props.deleteProperty('CATGIROS_ENTIDAD');
+        props.deleteProperty('CATGIROS_ESTRATOS');
+        props.deleteProperty('CATGIROS_ESTRATO_IDX');
+        props.deleteProperty('CATGIROS_INICIO');
+        props.deleteProperty('CATGIROS_CONTEOS');
+        props.deleteProperty('CATGIROS_DETENER');
+        Logger.log('Catálogo de giros: detenido por el usuario — entidad %s, estrato %s.', entidadCodigo, estrato);
+        return;
+      }
+
+      if (Date.now() - horaInicio > CATGIROS_TIEMPO_LIMITE_MS) {
+        props.setProperty('CATGIROS_ESTRATO_IDX', String(estratoIdx));
+        props.setProperty('CATGIROS_INICIO', String(inicio));
+        props.setProperty('CATGIROS_CONTEOS', JSON.stringify(conteos));
+        ScriptApp.newTrigger('ejecutarBloqueCatalogoGiros_').timeBased().after(60 * 1000).create();
+        Logger.log('Catálogo de giros: pausa por tiempo — entidad %s, estrato %s, retoma desde registro %s.',
+          entidadCodigo, estrato, inicio);
+        return;
+      }
+
+      const fin = inicio + DENUE_TAMANO_BLOQUE - 1;
+      const url = [
+        DENUE_BASE_URL, 'BuscarAreaActEstr', entidadCodigo, 0,
+        0, 0, 0, // Localidad, AGEB, Manzana
+        0, 0, 0, 0, // Sector, Subsector, Rama, Clase (0 = todas las actividades)
+        encodeURIComponent('0'), // Nombre — comodín, mismo criterio que buscarDenue() sin giro.
+        inicio, fin,
+        0, // Id
+        estrato,
+        DENUE_TOKEN,
+      ].join('/');
+
+      const respuesta = fetchDenueConReintentos_(url);
+      let bloque;
+      try {
+        bloque = JSON.parse(respuesta.getContentText());
+      } catch (e) {
+        throw new Error('Respuesta DENUE no es JSON válido (catálogo de giros): ' + respuesta.getContentText().substring(0, 200));
+      }
+
+      if (!Array.isArray(bloque) || bloque.length === 0) break; // este estrato ya se agotó.
+
+      bloque.forEach(function (registro) {
+        const clase = registro.Clase_actividad || '(sin clasificar)';
+        conteos[clase] = (conteos[clase] || 0) + 1;
+      });
+
+      if (bloque.length < DENUE_TAMANO_BLOQUE) break; // último bloque parcial — ya no hay más.
+
+      inicio = fin + 1;
+      Utilities.sleep(CATGIROS_PAUSA_MS);
+    }
+
+    guardarConteoEstratoGiros_(entidadCodigo, estrato, conteos);
+    conteos = {};
+    inicio = 1;
+    estratoIdx++;
+  }
+
+  props.deleteProperty('CATGIROS_ENTIDAD');
+  props.deleteProperty('CATGIROS_ESTRATOS');
+  props.deleteProperty('CATGIROS_ESTRATO_IDX');
+  props.deleteProperty('CATGIROS_INICIO');
+  props.deleteProperty('CATGIROS_CONTEOS');
+  Logger.log('Catálogo de giros: completo para entidad %s.', entidadCodigo);
+}
+
+/** Reemplaza (idempotente) las filas de Catalogo_Giros para esta
+ *  entidad+estrato con el conteo recién calculado. */
+function guardarConteoEstratoGiros_(entidadCodigo, estrato, conteos) {
+  const hoja = obtenerPestana_(SHEETS_PESTANAS.CATALOGO_GIROS);
+  const columnas = ENCABEZADOS[SHEETS_PESTANAS.CATALOGO_GIROS];
+  const idxEntidad = columnas.indexOf('entidad');
+  const idxEstrato = columnas.indexOf('estrato');
+
+  const ultimaFilaPrevia = hoja.getLastRow();
+  if (ultimaFilaPrevia >= 2) {
+    const datos = hoja.getRange(2, 1, ultimaFilaPrevia - 1, columnas.length).getValues();
+    for (let i = datos.length - 1; i >= 0; i--) {
+      if (String(datos[i][idxEntidad]) === String(entidadCodigo) && Number(datos[i][idxEstrato]) === estrato) {
+        hoja.deleteRow(i + 2);
+      }
+    }
+  }
+
+  const ahora = new Date();
+  const filas = Object.keys(conteos)
+    .sort(function (a, b) { return conteos[b] - conteos[a]; })
+    .map(function (clase) { return [entidadCodigo, estrato, clase, conteos[clase], ahora]; });
+
+  if (filas.length > 0) {
+    const ultimaFila = hoja.getLastRow();
+    hoja.getRange(ultimaFila + 1, 1, filas.length, columnas.length).setValues(filas);
+  }
+}
+
+/** Lectura instantánea para Pantalla ① — combina los estratos pedidos y
+ *  regresa el top N, sin llamar a DENUE. */
+function obtenerTopGirosCatalogo(entidadTexto, estratos, topN) {
+  const entidadCodigo = resolverEntidad_(entidadTexto);
+  if (!entidadCodigo) return { disponible: false, giros: [] };
+
+  const estratosPedidos = (estratos && estratos.length ? estratos : CATGIROS_ESTRATOS_DEFECTO).map(Number);
+  const estratosSet = {};
+  estratosPedidos.forEach(function (e) { estratosSet[e] = true; });
+
+  const hoja = obtenerPestana_(SHEETS_PESTANAS.CATALOGO_GIROS);
+  const columnas = ENCABEZADOS[SHEETS_PESTANAS.CATALOGO_GIROS];
+  const idxEntidad = columnas.indexOf('entidad');
+  const idxEstrato = columnas.indexOf('estrato');
+  const idxClase = columnas.indexOf('clase_actividad');
+  const idxCantidad = columnas.indexOf('cantidad');
+  const idxFecha = columnas.indexOf('fecha_actualizacion');
+
+  const ultimaFila = hoja.getLastRow();
+  if (ultimaFila < 2) return { disponible: false, giros: [] };
+
+  const datos = hoja.getRange(2, 1, ultimaFila - 1, columnas.length).getValues();
+  const combinado = {};
+  let fechaMasReciente = null;
+  let huboAlguno = false;
+
+  datos.forEach(function (fila) {
+    if (String(fila[idxEntidad]) !== String(entidadCodigo)) return;
+    if (!estratosSet[Number(fila[idxEstrato])]) return;
+    huboAlguno = true;
+    const clase = fila[idxClase];
+    combinado[clase] = (combinado[clase] || 0) + Number(fila[idxCantidad]);
+    if (!fechaMasReciente || fila[idxFecha] > fechaMasReciente) fechaMasReciente = fila[idxFecha];
+  });
+
+  if (!huboAlguno) return { disponible: false, giros: [] };
+
+  const total = Object.keys(combinado).reduce(function (suma, clase) { return suma + combinado[clase]; }, 0);
+  const giros = Object.keys(combinado)
+    .map(function (clase) { return { clase: clase, cantidad: combinado[clase] }; })
+    .sort(function (a, b) { return b.cantidad - a.cantidad; })
+    .slice(0, topN || 12)
+    .map(function (g) {
+      return { clase: g.clase, cantidad: g.cantidad, porcentaje: Math.round((g.cantidad / total) * 1000) / 10 };
+    });
+
+  return {
+    disponible: true,
+    total: total,
+    fechaActualizacion: fechaMasReciente ? fechaMasReciente.toISOString() : '',
+    giros: giros,
+  };
+}
+
+/** Estado de la actualización para una entidad — Pantalla ④ lo usa para
+ *  mostrar "en curso" / "lista, actualizada tal fecha" / "sin datos". */
+function obtenerEstadoCatalogoGiros(entidadTexto) {
+  const entidadCodigo = resolverEntidad_(entidadTexto);
+  if (!entidadCodigo) return { estado: 'sin_entidad' };
+
+  const props = PropertiesService.getScriptProperties();
+  const entidadEnCurso = props.getProperty('CATGIROS_ENTIDAD');
+  if (entidadEnCurso && Number(entidadEnCurso) === Number(entidadCodigo)) {
+    return { estado: 'en_curso' };
+  }
+
+  const hoja = obtenerPestana_(SHEETS_PESTANAS.CATALOGO_GIROS);
+  const columnas = ENCABEZADOS[SHEETS_PESTANAS.CATALOGO_GIROS];
+  const idxEntidad = columnas.indexOf('entidad');
+  const idxFecha = columnas.indexOf('fecha_actualizacion');
+  const ultimaFila = hoja.getLastRow();
+  if (ultimaFila < 2) return { estado: 'sin_datos' };
+
+  const datos = hoja.getRange(2, 1, ultimaFila - 1, columnas.length).getValues();
+  let fechaMasReciente = null;
+  datos.forEach(function (fila) {
+    if (String(fila[idxEntidad]) === String(entidadCodigo)) {
+      if (!fechaMasReciente || fila[idxFecha] > fechaMasReciente) fechaMasReciente = fila[idxFecha];
+    }
+  });
+
+  if (!fechaMasReciente) return { estado: 'sin_datos' };
+  return { estado: 'listo', fechaActualizacion: fechaMasReciente.toISOString() };
+}
+
+// ---------------------------------------------------------------------------
+// Funciones de prueba (correr manualmente desde el editor de Apps Script)
+// ---------------------------------------------------------------------------
+
+// Prueba SIN llamar al API — valida solo el catálogo/resolver nuevo del
+// 17 ago 2026 (correr esta primero, es instantánea, no gasta cuota DENUE).
+function test_catalogoMunicipios() {
+  Logger.log('Total entidades: %s (esperado 32)', ENTIDADES_LISTA.length);
+  const zapopanPorNombre = resolverMunicipio_(14, 'Zapopan');
+  const zapopanPorCodigoCorto = resolverMunicipio_(14, 120);
+  const guadalajaraPorNombre = resolverMunicipio_(14, 'Guadalajara');
+  Logger.log('Zapopan por nombre: %s (esperado "120")', zapopanPorNombre);
+  Logger.log('Zapopan por código corto 120: %s (esperado "120")', zapopanPorCodigoCorto);
+  Logger.log('Guadalajara por nombre: %s (esperado "039")', guadalajaraPorNombre);
+  const municipiosJalisco = obtenerMunicipiosDeEntidad('Jalisco');
+  Logger.log('Municipios de Jalisco: %s (esperado 125)', municipiosJalisco.length);
+  Logger.log('Primeros 3 (alfabético): %s', JSON.stringify(municipiosJalisco.slice(0, 3)));
+  const listaEntidades = obtenerListaEntidades();
+  Logger.log('Primeras 3 entidades (alfabético): %s', JSON.stringify(listaEntidades.slice(0, 3)));
+}
+
+function test_buscarPorGiro() {
+  const r = buscarDenue({ giro: 'panaderia', entidad: 'Jalisco', maxResultados: 10 });
+  Logger.log('Resultados: %s', r.length);
+  Logger.log(JSON.stringify(r[0], null, 2));
+}
+
+function test_buscarPorTamanoPuro() {
+  // Sin giro — solo estrato 251+ en Jalisco (confirma hallazgo #2).
+  const r = buscarDenue({ entidad: 'Jalisco', estrato: 7, maxResultados: 10 });
+  Logger.log('Resultados (solo tamaño, sin giro): %s', r.length);
+  r.forEach(function (x) { Logger.log('%s — %s', x.Nombre, x.Clase_actividad); });
+}
+
+function test_buscarPorGiroYCP() {
+  // Busca panaderías en Jalisco y filtra por CP 45050 (Zapopan) del lado cliente.
+  const r = buscarDenue({ giro: 'panaderia', entidad: 'Jalisco', cp: '45050', maxResultados: 2000 });
+  Logger.log('Panaderías en CP 45050: %s', r.length);
+}
+
+function test_buscarPorGiroYColonia() {
+  const r = buscarDenue({ giro: 'panaderia', entidad: 'Jalisco', colonia: 'LA CALMA', maxResultados: 2000 });
+  Logger.log('Panaderías en colonia LA CALMA: %s', r.length);
+}
+
+function test_buscarPorEstratosAgregados() {
+  // Caso de uso: "11 a 50 empleados" = estrato 3 (11-30) + estrato 4 (31-50).
+  const r = buscarDenue({ giro: 'panaderia', entidad: 'Jalisco', estrato: [3, 4], maxResultados: 2000 });
+  Logger.log('Panaderías de 11-50 empleados (estratos 3+4 combinados): %s', r.length);
+  r.forEach(function (x) { Logger.log('%s — %s', x.Nombre, x.Estrato); });
+}
+
+function test_buscarCombinado() {
+  // Giro + tamaño + CP, el caso de uso completo típico.
+  const r = buscarDenue({
+    giro: 'panaderia',
+    entidad: 'Jalisco',
+    estrato: 1, // 0-5 empleados
+    cp: '45050',
+    maxResultados: 2000,
+  });
+  Logger.log('Panaderías chicas (0-5 empleados) en CP 45050: %s', r.length);
+}

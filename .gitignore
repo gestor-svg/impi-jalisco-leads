@@ -1,0 +1,6 @@
+cookies.txt
+record_response.json
+*.secret
+.env
+__pycache__/
+*.pyc
