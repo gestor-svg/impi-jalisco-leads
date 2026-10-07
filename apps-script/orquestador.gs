@@ -20,6 +20,11 @@ const ORQ_DELAY_MARCANET_MS = 3000; // MARCANET degrada con peticiones rápidas 
  * @param {Array<string>} [opciones.clases] Clases de Niza — default ['37'] (construcción).
  * @param {string} [opciones.fechaDesde] 'YYYY-MM-DD' — default hoy-10 años.
  * @param {string} [opciones.fechaHasta] 'YYYY-MM-DD' — default hoy-5 años.
+ * @param {Array<string>} [opciones.appType] Default ['REGISTRO DE MARCA'] —
+ *        decisión del 7 oct 2026: excluye avisos comerciales y nombres
+ *        comerciales desde la búsqueda misma (nunca van a ser buscables en
+ *        Google ni aparecer en DENUE, no vale la pena ni traerlos). Ver
+ *        nota completa en construirQueryMarcia_ (marcia.gs).
  * @param {number} [opciones.maxResultadosMarcia] Default 1000.
  * @param {number} [opciones.objetivoJalisco] Default 100.
  * @returns {Object} Resumen de la corrida.
@@ -30,6 +35,7 @@ function ejecutarArchivo1(opciones) {
   const hoy = new Date();
   const fechaHasta = opciones.fechaHasta || formatearFechaISO_(sumarAnios_(hoy, -5));
   const fechaDesde = opciones.fechaDesde || formatearFechaISO_(sumarAnios_(hoy, -10));
+  const appType = opciones.appType || ['REGISTRO DE MARCA'];
   const maxResultadosMarcia = opciones.maxResultadosMarcia || 1000;
   const objetivoJalisco = opciones.objetivoJalisco || 100;
 
@@ -41,13 +47,14 @@ function ejecutarArchivo1(opciones) {
   const indiceDenue = construirIndiceDenue_(registrosDenue);
   const setCPsJalisco = construirSetCPsJalisco_(registrosDenue);
 
-  Logger.log('Paso 2/3: buscando en MARCia (clases=%s, %s a %s)...', clases.join(','), fechaDesde, fechaHasta);
+  Logger.log('Paso 2/3: buscando en MARCia (clases=%s, appType=%s, %s a %s)...', clases.join(','), appType.join(','), fechaDesde, fechaHasta);
   const resultadoMarcia = buscarMarcia({
     clases: clases,
     estatus: ['REGISTRADO'],
     fechaTipo: 'DATE_REGISTRATION',
     fechaDesde: fechaDesde,
     fechaHasta: fechaHasta,
+    appType: appType,
     maxResultados: maxResultadosMarcia,
   });
   Logger.log('MARCia: %s disponibles en total, %s traídos para este lote.', resultadoMarcia.totalDisponibles, resultadoMarcia.resultados.length);

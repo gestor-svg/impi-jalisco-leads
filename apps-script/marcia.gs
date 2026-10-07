@@ -125,6 +125,20 @@ function marciaPost_(sesion, ruta, payload) {
  *        Terminación); solo 'DATE_REGISTRATION' quedó confirmado en vivo.
  * @param {string} [opciones.fechaDesde] 'YYYY-MM-DD'.
  * @param {string} [opciones.fechaHasta] 'YYYY-MM-DD'.
+ * @param {Array<string>} [opciones.appType] Tipo de solicitud — valor real
+ *        confirmado en vivo (7 oct 2026, interceptando el XHR del propio
+ *        formulario, NO adivinado): 'REGISTRO DE MARCA' (el combo de la UI
+ *        solo dice "MARCA" pero manda este string completo). Otros valores
+ *        vistos en el dropdown: 'NOMBRE COMERCIAL', 'AVISO COMERCIAL',
+ *        'MARCAS FAMOSAS', 'MARCAS NOTORIAS', 'DENOMINACIONES COMUNES
+ *        INTERNACIONALES', 'ARTICULO 6TER (CONVENIO DE PARIS)'. El
+ *        orquestador usa ['REGISTRO DE MARCA'] por default (decisión del
+ *        7 oct 2026: avisos/nombres comerciales no sirven para este
+ *        proyecto, nunca van a aparecer buscables en Google ni en DENUE).
+ *        NOTA: no existe un filtro de servidor para nominativa/mixta — ese
+ *        dato no viene en absoluto en la respuesta de MARCia (se confirmó
+ *        inspeccionando un resultado real completo), solo existe en la
+ *        ficha de MARCANET.
  */
 function construirQueryMarcia_(opciones) {
   return {
@@ -144,7 +158,7 @@ function construirQueryMarcia_(opciones) {
       indicators: null,
       status: opciones.estatus && opciones.estatus.length ? opciones.estatus : null,
       markType: null,
-      appType: null,
+      appType: opciones.appType && opciones.appType.length ? opciones.appType : null,
       wordSet: null,
     },
     images: [],
@@ -222,4 +236,25 @@ function test_contarMarciaClase37() {
   if (resultado.totalDisponibles < 15000) {
     throw new Error('Total inesperadamente bajo — revisar si el payload sigue siendo válido.');
   }
+}
+
+/** Mismo caso pero con appType=REGISTRO DE MARCA (decisión del 7 oct
+ *  2026) — validado en vivo: 16,518 (vs 17,105 sin el filtro). */
+function test_contarMarciaClase37SoloMarca() {
+  const resultado = buscarMarcia({
+    clases: ['37'],
+    estatus: ['REGISTRADO'],
+    fechaTipo: 'DATE_REGISTRATION',
+    fechaDesde: '2016-10-06',
+    fechaHasta: '2021-10-06',
+    appType: ['REGISTRO DE MARCA'],
+    maxResultados: 5,
+  });
+  Logger.log('Total disponibles (solo REGISTRO DE MARCA): %s (esperado ~16518 el 7 oct 2026)', resultado.totalDisponibles);
+  resultado.resultados.forEach(function (r) {
+    if (r.appType !== 'REGISTRO DE MARCA') {
+      throw new Error('Se coló un resultado con appType distinto: ' + r.appType);
+    }
+  });
+  Logger.log('OK — todos los resultados son REGISTRO DE MARCA.');
 }

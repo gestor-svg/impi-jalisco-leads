@@ -42,6 +42,7 @@ function iniciarArchivo1Encadenado(opciones) {
   props.setProperty('ARCHIVO1_CLASES', JSON.stringify(opciones.clases || ['37']));
   props.setProperty('ARCHIVO1_FECHA_DESDE', opciones.fechaDesde || '');
   props.setProperty('ARCHIVO1_FECHA_HASTA', opciones.fechaHasta || '');
+  props.setProperty('ARCHIVO1_APP_TYPE', JSON.stringify(opciones.appType || ['REGISTRO DE MARCA']));
   props.setProperty('ARCHIVO1_MAX_MARCIA_TOTAL', String(opciones.maxMarciaTotal || 1000));
   props.setProperty('ARCHIVO1_OBJETIVO_TOTAL', String(opciones.objetivoTotal || 100));
   props.setProperty('ARCHIVO1_BLOQUE_ACTUAL', '1');
@@ -58,6 +59,7 @@ function ejecutarBloqueArchivo1_() {
   const clases = JSON.parse(props.getProperty('ARCHIVO1_CLASES') || '["37"]');
   const fechaDesde = props.getProperty('ARCHIVO1_FECHA_DESDE') || undefined;
   const fechaHasta = props.getProperty('ARCHIVO1_FECHA_HASTA') || undefined;
+  const appType = JSON.parse(props.getProperty('ARCHIVO1_APP_TYPE') || '["REGISTRO DE MARCA"]');
   const maxMarciaTotal = parseInt(props.getProperty('ARCHIVO1_MAX_MARCIA_TOTAL') || '1000', 10);
   const objetivoTotal = parseInt(props.getProperty('ARCHIVO1_OBJETIVO_TOTAL') || '100', 10);
   const bloqueActual = parseInt(props.getProperty('ARCHIVO1_BLOQUE_ACTUAL') || '1', 10);
@@ -75,6 +77,7 @@ function ejecutarBloqueArchivo1_() {
     clases: clases,
     fechaDesde: fechaDesde,
     fechaHasta: fechaHasta,
+    appType: appType,
     maxResultadosMarcia: maxMarciaEsteBloque,
     objetivoJalisco: objetivoEsteBloque,
   });
